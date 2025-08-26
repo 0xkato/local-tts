@@ -161,11 +161,8 @@ class PiperTTSEngine(TTSEngine):
         if not PYGAME_AVAILABLE:
             return False
         
-        try:
-            result = subprocess.run(["which", "piper"], capture_output=True, text=True)
-            if result.returncode != 0:
-                return False
-        except:
+        # Check if piper command is available
+        if not self.check_piper_installed():
             return False
         
         return os.path.exists(self.voice_model)
@@ -176,24 +173,27 @@ class PiperTTSEngine(TTSEngine):
     def check_piper_installed(self) -> bool:
         """Check if Piper is installed"""
         try:
-            result = subprocess.run(["which", "piper"], capture_output=True, text=True)
+            # Try to run piper with --help to see if it's installed
+            result = subprocess.run(["piper", "--help"], capture_output=True, text=True, timeout=2)
             return result.returncode == 0
-        except:
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
             return False
     
     def download_model(self, status_callback: Callable[[str], None]) -> bool:
         """Download the Piper voice model"""
         try:
+            import urllib.request
+            
             os.makedirs(self.piper_dir, exist_ok=True)
             
             model_url = "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/norman/medium/en_US-norman-medium.onnx"
             config_url = "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/norman/medium/en_US-norman-medium.onnx.json"
             
             status_callback("Downloading model file (12MB)...")
-            subprocess.run(["wget", "-O", self.voice_model, model_url], check=True)
+            urllib.request.urlretrieve(model_url, self.voice_model)
             
             status_callback("Downloading config file...")
-            subprocess.run(["wget", "-O", self.voice_config, config_url], check=True)
+            urllib.request.urlretrieve(config_url, self.voice_config)
             
             status_callback("Voice model downloaded successfully!")
             return True
@@ -209,20 +209,35 @@ class UnifiedTTSApp:
         self.root = root
         self.root.title("Text to Speech")
         
-        # Start maximized
-        try:
-            self.root.attributes('-zoomed', True)
-        except:
+        # Start with appropriate window size for each platform
+        if sys.platform == "darwin":  # macOS
+            # On macOS, set a more reasonable window size
+            self.root.geometry("900x700")
+            # Center the window
+            self.root.update_idletasks()
+            width = 900
+            height = 700
+            x = (self.root.winfo_screenwidth() // 2) - (width // 2)
+            y = (self.root.winfo_screenheight() // 2) - (height // 2)
+            self.root.geometry(f"{width}x{height}+{x}+{y}")
+        else:
+            # For Linux and Windows, try to maximize
             try:
-                self.root.wm_state('normal')
-                self.root.geometry("{0}x{1}+0+0".format(
-                    self.root.winfo_screenwidth(), 
-                    self.root.winfo_screenheight()
-                ))
+                self.root.attributes('-zoomed', True)
             except:
-                self.root.geometry("1000x800")
+                try:
+                    self.root.wm_state('normal')
+                    self.root.geometry("{0}x{1}+0+0".format(
+                        self.root.winfo_screenwidth(), 
+                        self.root.winfo_screenheight()
+                    ))
+                except:
+                    self.root.geometry("1000x800")
         
-        self.root.minsize(900, 700)
+        if sys.platform == "darwin":
+            self.root.minsize(800, 600)
+        else:
+            self.root.minsize(900, 700)
         
         # Initialize engines
         self.engines = {
@@ -241,7 +256,10 @@ class UnifiedTTSApp:
         """Create the user interface"""
         
         # Main container with better padding
-        main_frame = tk.Frame(self.root, padx=40, pady=30)
+        if sys.platform == "darwin":  # Reduce padding on macOS
+            main_frame = tk.Frame(self.root, padx=20, pady=15)
+        else:
+            main_frame = tk.Frame(self.root, padx=40, pady=30)
         main_frame.pack(expand=True, fill='both')
         
         # Title
@@ -276,15 +294,24 @@ class UnifiedTTSApp:
         self.engine_status.pack(side=tk.LEFT, padx=15)
         
         # Download button for Piper (hidden by default)
-        self.download_button = tk.Button(
-            engine_frame,
-            text="Download Voice Model",
-            command=self.download_piper_model,
-            bg="#2196F3",
-            fg="white",
-            font=("Arial", 11),
-            cursor="hand2"
-        )
+        if sys.platform == "darwin":  # macOS
+            self.download_button = tk.Button(
+                engine_frame,
+                text="Download Voice Model",
+                command=self.download_piper_model,
+                font=("Arial", 11),
+                highlightbackground="#2196F3"
+            )
+        else:
+            self.download_button = tk.Button(
+                engine_frame,
+                text="Download Voice Model",
+                command=self.download_piper_model,
+                bg="#2196F3",
+                fg="white",
+                font=("Arial", 11),
+                cursor="hand2"
+            )
         
         # Text area
         text_label = tk.Label(main_frame, text="Enter text to speak:", font=("Arial", 14))
@@ -366,17 +393,28 @@ class UnifiedTTSApp:
         button_frame = tk.Frame(controls_frame)
         button_frame.pack(pady=20)
         
-        self.play_button = tk.Button(
-            button_frame,
-            text="▶ PLAY",
-            command=self.toggle_play,
-            bg="#4CAF50",
-            fg="white",
-            font=("Arial", 16, "bold"),
-            width=20,
-            height=2,
-            cursor="hand2"
-        )
+        if sys.platform == "darwin":  # macOS
+            self.play_button = tk.Button(
+                button_frame,
+                text="▶ PLAY",
+                command=self.toggle_play,
+                font=("Arial", 16, "bold"),
+                width=20,
+                height=2,
+                highlightbackground="#4CAF50"
+            )
+        else:
+            self.play_button = tk.Button(
+                button_frame,
+                text="▶ PLAY",
+                command=self.toggle_play,
+                bg="#4CAF50",
+                fg="white",
+                font=("Arial", 16, "bold"),
+                width=20,
+                height=2,
+                cursor="hand2"
+            )
         self.play_button.pack()
         
         # Status
@@ -388,14 +426,7 @@ class UnifiedTTSApp:
         available_engines = []
         engine_items = []
         
-        # Check Google TTS
-        if self.engines['google'].is_available():
-            available_engines.append('google')
-            engine_items.append("Google TTS (Online)")
-        else:
-            engine_items.append("Google TTS (Not Available - Install gtts & pygame)")
-        
-        # Check Piper TTS
+        # Check Piper TTS FIRST (so it appears first in dropdown)
         piper_engine = self.engines['piper']
         if piper_engine.is_available():
             available_engines.append('piper')
@@ -405,20 +436,35 @@ class UnifiedTTSApp:
         else:
             engine_items.append("Piper TTS (Not Installed - pip install piper-tts)")
         
+        # Check Google TTS SECOND
+        if self.engines['google'].is_available():
+            available_engines.append('google')
+            engine_items.append("Google TTS (Online)")
+        else:
+            engine_items.append("Google TTS (Not Available - Install gtts & pygame)")
+        
         self.engine_combo['values'] = engine_items
         
-        # Select first available engine or show error
+        # Always select first item in list (Piper will be first if available)
         if available_engines:
-            if 'piper' in available_engines:
-                # Prefer Piper if available
-                idx = [i for i, item in enumerate(engine_items) if "Piper TTS (Offline)" in item][0]
-                self.engine_combo.current(idx)
+            # Select the first available engine in the dropdown
+            self.engine_combo.current(0)
+            
+            # Set the current engine based on what's first
+            first_item = engine_items[0]
+            if "Piper TTS (Offline)" in first_item:
                 self.current_engine = self.engines['piper']
-            else:
-                # Use Google TTS
-                idx = [i for i, item in enumerate(engine_items) if "Google TTS (Online)" in item][0]
-                self.engine_combo.current(idx)
+            elif "Google TTS (Online)" in first_item:
                 self.current_engine = self.engines['google']
+            else:
+                # Neither is fully available, but set based on what's selected
+                for engine_key in available_engines:
+                    if engine_key == 'piper' and "Piper" in first_item:
+                        self.current_engine = self.engines['piper']
+                        break
+                    elif engine_key == 'google' and "Google" in first_item:
+                        self.current_engine = self.engines['google']
+                        break
             
             self.on_engine_change()
             self.status_label.config(text="Ready", fg="green")
@@ -517,7 +563,10 @@ class UnifiedTTSApp:
             return
         
         self.is_speaking = True
-        self.play_button.config(text="⏹ STOP", bg="#f44336")
+        if sys.platform == "darwin":
+            self.play_button.config(text="⏹ STOP")
+        else:
+            self.play_button.config(text="⏹ STOP", bg="#f44336")
         self.status_label.config(text="Speaking...", fg="blue")
         
         # Get language if using Google TTS
@@ -551,7 +600,10 @@ class UnifiedTTSApp:
     def reset_ui(self):
         """Reset UI to ready state"""
         self.is_speaking = False
-        self.play_button.config(text="▶ PLAY", bg="#4CAF50")
+        if sys.platform == "darwin":
+            self.play_button.config(text="▶ PLAY")
+        else:
+            self.play_button.config(text="▶ PLAY", bg="#4CAF50")
         
         if self.current_engine:
             engine_name = self.current_engine.get_name()
@@ -583,16 +635,19 @@ def check_dependencies():
             missing.append(dep)
             print(f"✗ {dep} - Not installed")
     
-    # Check for Piper
+    # Check for Piper (cross-platform)
+    piper_available = False
     try:
-        result = subprocess.run(["which", "piper"], capture_output=True, text=True)
+        result = subprocess.run(["piper", "--help"], capture_output=True, text=True, timeout=2)
         if result.returncode == 0:
-            print("✓ piper - Available")
-            available.append('piper')
-        else:
-            print("✗ piper - Not installed")
-            missing.append('piper')
-    except:
+            piper_available = True
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        piper_available = False
+    
+    if piper_available:
+        print("✓ piper - Available")
+        available.append('piper')
+    else:
         print("✗ piper - Not installed")
         missing.append('piper')
     

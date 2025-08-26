@@ -1,119 +1,93 @@
-# Text-to-Speech Application
+# Local TTS - Free Text-to-Speech App
 
-A clean, unified Text-to-Speech application supporting Google TTS (online) and Piper TTS (offline) engines.
+A simple, free text-to-speech application that works completely offline. No API keys, no subscriptions, no internet required (after initial setup).
 
-## Features
+## Why Use This?
 
-- **Two TTS Engines**:
-  - **Google TTS** - High-quality online TTS with 10+ languages
-  - **Piper TTS** - Fast, neural network-based offline TTS
-  
-- **User Interface**:
-  - Starts maximized for better visibility
-  - Clean dropdown for engine selection
-  - Adjustable speech speed (0.5x - 2.0x)
-  - Multi-language support (Google TTS)
-  - Real-time status updates
-  - Play/Stop functionality
+- **100% Free** - No API costs or usage limits
+- **Privacy First** - Your text never leaves your computer
+- **Works Offline** - Once set up, no internet needed
+- **High Quality** - Natural sounding voices using Piper TTS
+- **Simple** - Clean UI, just type and click play
 
 ## Quick Start
 
+### macOS/Linux/Windows
+
+1. **Clone the repo:**
 ```bash
-# Clone and enter directory
-git clone <your-repo-url>
-cd function
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Run the application
-python tts_unified.py
+git clone https://github.com/yourusername/local-tts.git
+cd local-tts
 ```
 
-## Installation
-
-### Basic Setup (Google TTS only)
+2. **Run the setup script:**
 ```bash
-pip install gtts pygame
+bash setup_and_run.sh
 ```
 
-### Full Setup (with Piper TTS)
-```bash
-# Install Google TTS and pygame
-pip install gtts pygame
+3. **Type your text and click PLAY!**
 
-# Install Piper TTS
-pip install piper-tts
+That's it! The app will install everything it needs and start automatically.
+
+## Features
+
+- **Piper TTS (Offline)** - High-quality offline voice synthesis
+- **Google TTS (Online)** - Optional backup with multiple languages
+- **Adjustable Speed** - Control how fast the text is spoken
+- **Clean Interface** - Simple, easy-to-use design
+
+## Manual Installation
+
+If you prefer to install manually:
+
+```bash
+# Install Python dependencies
+pip install gtts pygame piper-tts
+
+# Download voice model (12MB)
+mkdir -p ~/.local/share/piper
+wget -O ~/.local/share/piper/en_US-norman-medium.onnx \
+  https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/norman/medium/en_US-norman-medium.onnx
+wget -O ~/.local/share/piper/en_US-norman-medium.onnx.json \
+  https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/norman/medium/en_US-norman-medium.onnx.json
+
+# Run the app
+python3 tts_unified.py
 ```
 
-The app will automatically download Piper voice models on first use.
+## Using with uv (Python Package Manager)
 
-### Check Available Engines
+If you use `uv` for Python package management:
+
 ```bash
-python tts_unified.py --check
+uv venv
+uv pip install gtts pygame piper-tts
+uv run python tts_unified.py
 ```
 
-## Usage
+## System Requirements
 
-1. **Launch**: Run `python tts_unified.py`
-2. **Select Engine**: Choose between Google TTS (online) or Piper TTS (offline)
-3. **Enter Text**: Type or paste your text
-4. **Configure**:
-   - Adjust speed slider (0.5x - 2.0x)
-   - Select language (Google TTS only)
-5. **Play**: Click PLAY button to hear the text
-6. **Stop**: Click STOP to interrupt
-
-## Engine Comparison
-
-| Feature | Google TTS | Piper TTS |
-|---------|------------|-----------|
-| Internet Required | Yes | No |
-| Voice Quality | Excellent | Very Good |
-| Speed | Moderate | Fast |
-| Languages | 10+ | English |
-| Size | Small | ~12MB model |
+- Python 3.7+
+- ~50MB disk space (includes voice model)
+- Audio output device
 
 ## Troubleshooting
 
-### No engines available
-```bash
-# Install at least one engine
-pip install gtts pygame
-```
+**"No TTS engines available"**
+- Run `bash setup_and_run.sh` to install all dependencies
 
-### Piper TTS not working
-```bash
-# Install Piper
-pip install piper-tts
+**UI looks broken on macOS**
+- Use the provided `run_tts.command` file or run with: `/usr/local/bin/python3 tts_unified.py`
 
-# The app will auto-download voice models
-# Or manually download if needed
-```
-
-### Audio issues on Linux
-```bash
-# Install audio libraries
-sudo apt-get install python3-pyaudio
-sudo apt-get install libsdl2-mixer-2.0-0
-```
-
-## Requirements
-
-- Python 3.7+
-- tkinter (included with Python)
-- pygame for audio playback
-- Internet connection (Google TTS only)
-
-## Project Structure
-
-```
-function/
-├── tts_unified.py    # Main application
-├── requirements.txt  # Dependencies
-└── README.md        # Documentation
-```
+**No sound output**
+- Check your system audio settings
+- Make sure pygame is installed: `pip install pygame`
 
 ## License
 
-Open source - feel free to use and modify!
+MIT - Use it however you want!
+
+## Credits
+
+- Powered by [Piper TTS](https://github.com/rhasspy/piper) for offline synthesis
+- Optional [gTTS](https://github.com/pndurette/gTTS) for online backup

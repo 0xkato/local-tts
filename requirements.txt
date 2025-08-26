@@ -1,0 +1,6 @@
+# Core TTS dependencies
+gtts==2.5.0          # Google TTS engine (online)
+pygame==2.5.2        # Audio playback for both engines
+
+# Optional: For Piper TTS (offline)
+# pip install piper-tts

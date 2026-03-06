@@ -718,41 +718,29 @@ class UnifiedTTSApp:
         self.progress_label.pack()
 
         # ── Transport controls ──
+        # Use Canvas-based buttons so colors work on macOS (tk.Button ignores bg/fg)
         transport_frame = tk.Frame(controls_frame, bg=self.BG)
         transport_frame.pack(pady=10)
 
-        transport_btn_cfg = dict(
-            relief=tk.FLAT, cursor="hand2", borderwidth=0,
-            font=("Helvetica", 16, "bold"), width=4, height=1,
-            activeforeground="white", padx=10, pady=6,
+        self.prev_button = self._make_transport_btn(
+            transport_frame, "⏮", self.ACCENT_BLUE, self.on_prev, size=50,
         )
+        self.prev_button.pack(side=tk.LEFT, padx=6)
 
-        self.prev_button = tk.Button(
-            transport_frame, text="⏮", bg=self.ACCENT_BLUE, fg="white",
-            activebackground="#1976D2", command=self.on_prev, **transport_btn_cfg,
+        self.play_pause_button = self._make_transport_btn(
+            transport_frame, "▶", self.ACCENT_GREEN, self.on_play_pause, size=64, font_size=26,
         )
-        self.prev_button.pack(side=tk.LEFT, padx=4)
+        self.play_pause_button.pack(side=tk.LEFT, padx=8)
 
-        self.play_pause_button = tk.Button(
-            transport_frame, text="▶", bg=self.ACCENT_GREEN, fg="white",
-            activebackground="#388E3C", command=self.on_play_pause,
-            relief=tk.FLAT, cursor="hand2", borderwidth=0,
-            font=("Helvetica", 20, "bold"), width=5, height=1,
-            activeforeground="white", padx=14, pady=6,
+        self.stop_button = self._make_transport_btn(
+            transport_frame, "⏹", self.ACCENT_RED, self.on_stop, size=50,
         )
-        self.play_pause_button.pack(side=tk.LEFT, padx=6)
+        self.stop_button.pack(side=tk.LEFT, padx=6)
 
-        self.stop_button = tk.Button(
-            transport_frame, text="⏹", bg=self.ACCENT_RED, fg="white",
-            activebackground="#C62828", command=self.on_stop, **transport_btn_cfg,
+        self.next_button = self._make_transport_btn(
+            transport_frame, "⏭", self.ACCENT_BLUE, self.on_next, size=50,
         )
-        self.stop_button.pack(side=tk.LEFT, padx=4)
-
-        self.next_button = tk.Button(
-            transport_frame, text="⏭", bg=self.ACCENT_BLUE, fg="white",
-            activebackground="#1976D2", command=self.on_next, **transport_btn_cfg,
-        )
-        self.next_button.pack(side=tk.LEFT, padx=4)
+        self.next_button.pack(side=tk.LEFT, padx=6)
 
         # ── Resume banner (hidden by default) ──
         self.resume_frame = tk.Frame(main_frame, bg=self.BANNER_BG, padx=12, pady=6)
@@ -781,6 +769,84 @@ class UnifiedTTSApp:
         )
         self.status_label.pack(pady=8)
     
+    def _make_transport_btn(self, parent, text, color, command, size=50, font_size=18):
+        """Create a colored round-rect canvas button that works on all platforms."""
+        canvas = tk.Canvas(
+            parent, width=size, height=size,
+            bg=self.BG, highlightthickness=0, cursor="hand2",
+        )
+        r = 10  # corner radius
+        # Draw rounded rectangle
+        rect_id = self._round_rect(canvas, 2, 2, size - 2, size - 2, r, fill=color, outline="")
+        text_id = canvas.create_text(
+            size // 2, size // 2, text=text, fill="white",
+            font=("Helvetica", font_size, "bold"),
+        )
+        # Store metadata for later updates
+        canvas._btn_rect = rect_id
+        canvas._btn_text = text_id
+        canvas._btn_color = color
+        canvas._btn_size = size
+
+        # Hover effects
+        def on_enter(e):
+            canvas.itemconfig(rect_id, fill=self._lighten(color, 0.15))
+        def on_leave(e):
+            canvas.itemconfig(rect_id, fill=canvas._btn_color)
+        def on_click(e):
+            command()
+
+        canvas.bind("<Enter>", on_enter)
+        canvas.bind("<Leave>", on_leave)
+        canvas.bind("<Button-1>", on_click)
+        canvas.tag_bind(rect_id, "<Button-1>", on_click)
+        canvas.tag_bind(text_id, "<Button-1>", on_click)
+
+        return canvas
+
+    def _round_rect(self, canvas, x1, y1, x2, y2, r, **kwargs):
+        """Draw a rounded rectangle on a canvas."""
+        points = [
+            x1 + r, y1,   x2 - r, y1,   x2, y1,   x2, y1 + r,
+            x2, y2 - r,   x2, y2,        x2 - r, y2,
+            x1 + r, y2,   x1, y2,        x1, y2 - r,
+            x1, y1 + r,   x1, y1,        x1 + r, y1,
+        ]
+        return canvas.create_polygon(points, smooth=True, **kwargs)
+
+    @staticmethod
+    def _lighten(hex_color, amount):
+        """Lighten a hex color by a fraction."""
+        r = int(hex_color[1:3], 16)
+        g = int(hex_color[3:5], 16)
+        b = int(hex_color[5:7], 16)
+        r = min(255, int(r + (255 - r) * amount))
+        g = min(255, int(g + (255 - g) * amount))
+        b = min(255, int(b + (255 - b) * amount))
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    def _update_play_button(self, text, color):
+        """Update the play/pause canvas button's icon and color."""
+        c = self.play_pause_button
+        c._btn_color = color
+        c.itemconfig(c._btn_rect, fill=color)
+        c.itemconfig(c._btn_text, text=text)
+
+    def _set_play_button_enabled(self, enabled):
+        """Enable or dim the play/pause canvas button."""
+        c = self.play_pause_button
+        if enabled:
+            c._btn_color = self.ACCENT_GREEN
+            c.itemconfig(c._btn_rect, fill=self.ACCENT_GREEN)
+            c.itemconfig(c._btn_text, fill="white")
+            c.configure(cursor="hand2")
+            c._enabled = True
+        else:
+            c.itemconfig(c._btn_rect, fill=self.BG_LIGHT)
+            c.itemconfig(c._btn_text, fill=self.FG_DIM)
+            c.configure(cursor="")
+            c._enabled = False
+
     def check_engines_and_initialize(self):
         """Check available engines and initialize"""
         available_engines = []
@@ -831,7 +897,7 @@ class UnifiedTTSApp:
         else:
             self.engine_combo.current(0)
             self.status_label.config(text="No TTS engines available. Please install dependencies.", fg=self.ACCENT_RED)
-            self.play_pause_button.config(state="disabled")
+            self._set_play_button_enabled(False)
     
     def on_engine_change(self, event=None):
         """Handle engine selection change"""
@@ -843,25 +909,25 @@ class UnifiedTTSApp:
         if "Google TTS (Online)" in selection:
             self.current_engine = self.engines['google']
             self.lang_frame.pack(pady=10)
-            self.play_pause_button.config(state="normal")
+            self._set_play_button_enabled(True)
             self.status_label.config(text="Ready - Google TTS", fg=self.ACCENT_GREEN)
 
         elif "Piper TTS (Offline)" in selection:
             self.current_engine = self.engines['piper']
             self.lang_frame.pack_forget()
-            self.play_pause_button.config(state="normal")
+            self._set_play_button_enabled(True)
             self.status_label.config(text="Ready - Piper TTS", fg=self.ACCENT_GREEN)
 
         elif "Model Not Downloaded" in selection:
             self.current_engine = None
             self.lang_frame.pack_forget()
-            self.play_pause_button.config(state="disabled")
+            self._set_play_button_enabled(False)
             self.download_button.pack(side=tk.LEFT, padx=20)
             self.status_label.config(text="Download voice model to use Piper TTS", fg=self.ACCENT_ORANGE)
 
         else:
             self.current_engine = None
-            self.play_pause_button.config(state="disabled")
+            self._set_play_button_enabled(False)
             if "Google" in selection:
                 self.status_label.config(text="Install: pip install gtts pygame", fg=self.ACCENT_ORANGE)
             else:
@@ -905,6 +971,8 @@ class UnifiedTTSApp:
         self.speed_label.config(text=f"{speed:.1f}x")
     
     def on_play_pause(self):
+        if getattr(self.play_pause_button, '_enabled', True) is False:
+            return
         if self.playback.state == PlaybackController.State.STOPPED:
             text = self.text_area.get("1.0", tk.END).strip()
             if not text:
@@ -949,7 +1017,7 @@ class UnifiedTTSApp:
     def _start_playback(self):
         self.playback.state = PlaybackController.State.PLAYING
         self._stop_event.clear()
-        self.play_pause_button.config(text="⏸", bg=self.ACCENT_ORANGE)
+        self._update_play_button("⏸", self.ACCENT_ORANGE)
         self.status_label.config(text="Speaking...", fg=self.ACCENT_BLUE)
         self._update_progress()
         self._playback_thread = threading.Thread(target=self._playback_loop, daemon=True)
@@ -960,7 +1028,7 @@ class UnifiedTTSApp:
         self._stop_event.set()
         if PYGAME_AVAILABLE:
             pygame.mixer.music.stop()
-        self.play_pause_button.config(text="▶", bg=self.ACCENT_GREEN)
+        self._update_play_button("▶", self.ACCENT_GREEN)
         self.status_label.config(text="Paused", fg=self.ACCENT_ORANGE)
         self.playback.save_current_position(
             speed=self.speed_var.get(),
@@ -974,7 +1042,7 @@ class UnifiedTTSApp:
             pygame.mixer.music.stop()
         self.playback.cleanup_buffer()
         self.playback.current_index = 0
-        self.play_pause_button.config(text="▶", bg=self.ACCENT_GREEN)
+        self._update_play_button("▶", self.ACCENT_GREEN)
         self.status_label.config(
             text=f"Ready - {self.current_engine.get_name()}" if self.current_engine else "Ready",
             fg=self.ACCENT_GREEN,
@@ -1091,7 +1159,7 @@ class UnifiedTTSApp:
             self.root.after(0, self._on_playback_finished)
 
     def _on_playback_finished(self):
-        self.play_pause_button.config(text="▶", bg=self.ACCENT_GREEN)
+        self._update_play_button("▶", self.ACCENT_GREEN)
         self._clear_highlight()
         self.playback.cleanup_buffer()
         if self.playback.session_store:

@@ -8,6 +8,7 @@ import re
 import hashlib
 import json
 import time
+from enum import Enum
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
 import threading
@@ -391,6 +392,100 @@ class PiperTTSEngine(TTSEngine):
         except Exception as e:
             status_callback(f"Download failed: {str(e)}")
             return False
+
+
+class PlaybackController:
+    """Manages sentence-by-sentence playback with lookahead buffering."""
+
+    class State(Enum):
+        STOPPED = "stopped"
+        PLAYING = "playing"
+        PAUSED = "paused"
+
+    def __init__(self, engine=None, session_store=None):
+        self.engine = engine
+        self.session_store = session_store
+        self.splitter = SentenceSplitter()
+
+        self.state = self.State.STOPPED
+        self.sentences = []
+        self.positions = []
+        self.current_index = 0
+        self.total_sentences = 0
+        self.original_text = ""
+
+        self._buffer = {}
+        self._buffer_lock = threading.Lock()
+
+    @property
+    def current_sentence(self) -> str:
+        if 0 <= self.current_index < self.total_sentences:
+            return self.sentences[self.current_index]
+        return ""
+
+    @property
+    def current_position(self) -> tuple:
+        if 0 <= self.current_index < len(self.positions):
+            return self.positions[self.current_index]
+        return (0, 0)
+
+    def load_text(self, text: str):
+        self.original_text = text
+        self.sentences = self.splitter.split(text)
+        self.positions = self.splitter.get_positions(text)
+        self.total_sentences = len(self.sentences)
+        self.current_index = 0
+        self.state = self.State.STOPPED
+        self.cleanup_buffer()
+
+    def next_sentence(self):
+        if self.current_index < self.total_sentences - 1:
+            self.current_index += 1
+
+    def prev_sentence(self):
+        if self.current_index > 0:
+            self.current_index -= 1
+
+    def seek_to(self, index: int):
+        self.current_index = max(0, min(index, self.total_sentences - 1))
+
+    def generate_sentence(self, index: int, speed: float, **kwargs) -> str:
+        with self._buffer_lock:
+            if index in self._buffer and os.path.exists(self._buffer[index]):
+                return self._buffer[index]
+        if index < 0 or index >= self.total_sentences:
+            return None
+        audio_path = self.engine.generate(self.sentences[index], speed, **kwargs)
+        with self._buffer_lock:
+            self._buffer[index] = audio_path
+        return audio_path
+
+    def check_saved_position(self) -> dict | None:
+        if self.session_store and self.original_text:
+            return self.session_store.load_position(self.original_text)
+        return None
+
+    def save_current_position(self, speed: float, engine_name: str):
+        if self.session_store and self.original_text:
+            self.session_store.save_position(
+                self.original_text,
+                sentence_index=self.current_index,
+                speed=speed,
+                engine=engine_name,
+            )
+
+    def cleanup_buffer(self):
+        with self._buffer_lock:
+            for path in self._buffer.values():
+                if path and os.path.exists(path):
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        pass
+            self._buffer.clear()
+
+    def cleanup(self):
+        self.cleanup_buffer()
 
 
 class UnifiedTTSApp:

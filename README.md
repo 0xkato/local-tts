@@ -1,51 +1,42 @@
-# Local TTS - Free Text-to-Speech App
+# Local TTS
 
-A simple, free text-to-speech application with both online and offline options. No API keys or subscriptions required.
+We didn't want to pay for a text-to-speech Chrome extension, so we built our own.
 
-## Why Use This?
+## What It Does
 
-- **100% Free** - No API costs or usage limits
-- **Privacy Option** - Use Piper TTS offline - your text never leaves your computer
-- **Flexible** - Choose between online (Google TTS) or offline (Piper TTS) engines
-- **Simple** - Clean UI, just type and click play
+Paste in an article, hit play, and listen. The app splits your text into sentences and reads them one at a time, so you can pause, skip around, and pick up where you left off -- even after closing the app.
 
 ## Quick Start
 
-1. **Clone the repo:**
 ```bash
 git clone https://github.com/0xkato/local-tts.git
 cd local-tts
-```
-
-2. **Set up with uv:**
-```bash
-uv venv
-uv pip install -r requirements.txt
-```
-
-3. **Run the app:**
-```bash
+uv venv && uv pip install -r requirements.txt
 uv run python tts_unified.py
 ```
 
-4. **Type your text and click PLAY!**
-
 ## Features
 
-- **Google TTS (Online)** - Default engine with multiple languages
-- **Piper TTS (Offline)** - Optional high-quality offline voice synthesis
-- **Adjustable Speed** - Control how fast the text is spoken
-- **Clean Interface** - Simple, easy-to-use design
+- **Sentence-by-sentence playback** -- text is split into sentences, played one at a time with the current sentence highlighted
+- **Pause and resume** -- stop mid-article, come back later, pick up right where you left off
+- **Transport controls** -- prev, play/pause, stop, next -- like a media player
+- **Progress tracking** -- see how far through the text you are as a percentage
+- **Persistent position** -- close the app, reopen it, paste the same text, and it asks if you want to resume
+- **Speed control** -- defaults to 1.5x, adjustable from 0.5x to 2.0x
+- **Two engines** -- Google TTS (online, multiple languages) or Piper TTS (offline, private)
+- **Dark themed UI** -- colored transport buttons, highlighted current sentence
 
-## Optional: Enable Offline Mode with Piper TTS
+## Offline Mode (Optional)
 
-For completely offline text-to-speech:
+Want it fully offline? Install Piper TTS:
 
 ```bash
-# Install Piper TTS
 uv pip install piper-tts
+```
 
-# Download voice model (12MB) 
+Then download a voice model (12MB):
+
+```bash
 mkdir -p ~/.local/share/piper
 wget -O ~/.local/share/piper/en_US-norman-medium.onnx \
   https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/norman/medium/en_US-norman-medium.onnx
@@ -53,40 +44,13 @@ wget -O ~/.local/share/piper/en_US-norman-medium.onnx.json \
   https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/norman/medium/en_US-norman-medium.onnx.json
 ```
 
-Then select "Piper TTS" from the engine dropdown in the app.
+Select "Piper TTS" from the engine dropdown.
 
-## Alternative: Using pip
-
-If you prefer traditional pip:
-
-```bash
-pip install -r requirements.txt
-python3 tts_unified.py
-```
-
-## System Requirements
+## Requirements
 
 - Python 3.7+
-- ~50MB disk space (includes voice model)
 - Audio output device
-
-## Troubleshooting
-
-**"No TTS engines available"**
-- Make sure you've installed dependencies: `uv pip install -r requirements.txt`
-
-**UI looks broken on macOS**
-- Try running with system Python: `/usr/local/bin/python3 tts_unified.py`
-
-**No sound output**
-- Check your system audio settings
-- Make sure pygame is installed: `uv pip install pygame`
 
 ## License
 
-MIT - Use it however you want!
-
-## Credits
-
-- Powered by [Piper TTS](https://github.com/rhasspy/piper) for offline synthesis
-- Optional [gTTS](https://github.com/pndurette/gTTS) for online backup
+MIT

@@ -491,46 +491,43 @@ class PlaybackController:
 class UnifiedTTSApp:
     """Main application window"""
     
+    # Color palette
+    BG = "#1B2838"
+    BG_LIGHT = "#2A3A4A"
+    BG_CARD = "#233345"
+    FG = "#E8EDF2"
+    FG_DIM = "#8899AA"
+    ACCENT_BLUE = "#2196F3"
+    ACCENT_GREEN = "#4CAF50"
+    ACCENT_RED = "#E53935"
+    ACCENT_ORANGE = "#FF9800"
+    ACCENT_AMBER = "#FF8F00"
+    HIGHLIGHT = "#FF8F00"
+    BANNER_BG = "#FFF176"
+    BANNER_FG = "#333333"
+
     def __init__(self, root):
         self.root = root
         self.root.title("Text to Speech")
-        
-        # Start with appropriate window size for each platform
-        if sys.platform == "darwin":  # macOS
-            # On macOS, set a more reasonable window size
-            self.root.geometry("900x700")
-            # Center the window
-            self.root.update_idletasks()
-            width = 900
-            height = 700
-            x = (self.root.winfo_screenwidth() // 2) - (width // 2)
-            y = (self.root.winfo_screenheight() // 2) - (height // 2)
-            self.root.geometry(f"{width}x{height}+{x}+{y}")
-        else:
-            # For Linux and Windows, try to maximize
-            try:
-                self.root.attributes('-zoomed', True)
-            except:
-                try:
-                    self.root.wm_state('normal')
-                    self.root.geometry("{0}x{1}+0+0".format(
-                        self.root.winfo_screenwidth(), 
-                        self.root.winfo_screenheight()
-                    ))
-                except:
-                    self.root.geometry("1000x800")
-        
-        if sys.platform == "darwin":
-            self.root.minsize(800, 600)
-        else:
-            self.root.minsize(900, 700)
-        
+        self.root.configure(bg=self.BG)
+
+        # Window size
+        width, height = 900, 720
+        self.root.geometry(f"{width}x{height}")
+        self.root.update_idletasks()
+        x = (self.root.winfo_screenwidth() // 2) - (width // 2)
+        y = (self.root.winfo_screenheight() // 2) - (height // 2)
+        self.root.geometry(f"{width}x{height}+{x}+{y}")
+        self.root.minsize(800, 600)
+
+        self._setup_theme()
+
         # Initialize engines
         self.engines = {
             'google': GoogleTTSEngine(),
             'piper': PiperTTSEngine()
         }
-        
+
         self.current_engine = None
         self.session_store = SessionStore()
         self.session_store.prune_old()
@@ -541,196 +538,248 @@ class UnifiedTTSApp:
         self.create_ui()
         self.check_engines_and_initialize()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _setup_theme(self):
+        style = ttk.Style()
+        style.theme_use("clam")
+
+        style.configure("TCombobox",
+            fieldbackground=self.BG_LIGHT,
+            background=self.BG_LIGHT,
+            foreground=self.FG,
+            arrowcolor=self.FG,
+            borderwidth=1,
+            relief="flat",
+        )
+        style.map("TCombobox",
+            fieldbackground=[("readonly", self.BG_LIGHT)],
+            foreground=[("readonly", self.FG)],
+            selectbackground=[("readonly", self.BG_LIGHT)],
+            selectforeground=[("readonly", self.FG)],
+        )
+
+        style.configure("Horizontal.TScale",
+            background=self.BG,
+            troughcolor=self.BG_LIGHT,
+            borderwidth=0,
+        )
+
+        # Option menu popup styling
+        self.root.option_add("*TCombobox*Listbox.background", self.BG_LIGHT)
+        self.root.option_add("*TCombobox*Listbox.foreground", self.FG)
+        self.root.option_add("*TCombobox*Listbox.selectBackground", self.ACCENT_BLUE)
+        self.root.option_add("*TCombobox*Listbox.selectForeground", "#FFFFFF")
     
     def create_ui(self):
         """Create the user interface"""
-        
-        # Main container with better padding
-        if sys.platform == "darwin":  # Reduce padding on macOS
-            main_frame = tk.Frame(self.root, padx=20, pady=15)
-        else:
-            main_frame = tk.Frame(self.root, padx=40, pady=30)
+
+        # Main container
+        main_frame = tk.Frame(self.root, bg=self.BG, padx=30, pady=20)
         main_frame.pack(expand=True, fill='both')
         self.main_frame = main_frame
 
-        # Title
-        title_frame = tk.Frame(main_frame)
-        title_frame.pack(pady=(0, 20))
-        
-        title_label = tk.Label(title_frame, text="Text to Speech", font=("Arial", 28, "bold"))
-        title_label.pack()
-        
-        subtitle_label = tk.Label(title_frame, text="Powered by Google TTS and Piper TTS", font=("Arial", 13), fg="gray")
-        subtitle_label.pack()
-        
-        # Engine selection
-        engine_frame = tk.Frame(main_frame)
-        engine_frame.pack(pady=15, fill='x')
-        
-        engine_label = tk.Label(engine_frame, text="Select Engine:", font=("Arial", 14))
-        engine_label.pack(side=tk.LEFT, padx=(0, 15))
-        
+        # ── Title ──
+        title_frame = tk.Frame(main_frame, bg=self.BG)
+        title_frame.pack(pady=(0, 15))
+
+        tk.Label(
+            title_frame, text="Text to Speech",
+            font=("Helvetica", 30, "bold"), fg=self.FG, bg=self.BG,
+        ).pack()
+        tk.Label(
+            title_frame, text="Powered by Google TTS and Piper TTS",
+            font=("Helvetica", 12), fg=self.FG_DIM, bg=self.BG,
+        ).pack()
+
+        # ── Engine selection row ──
+        engine_frame = tk.Frame(main_frame, bg=self.BG)
+        engine_frame.pack(pady=8, fill='x')
+
+        tk.Label(
+            engine_frame, text="Engine:", font=("Helvetica", 13, "bold"),
+            fg=self.FG, bg=self.BG,
+        ).pack(side=tk.LEFT, padx=(0, 10))
+
         self.engine_var = tk.StringVar()
         self.engine_combo = ttk.Combobox(
-            engine_frame,
-            textvariable=self.engine_var,
-            state="readonly",
-            width=35,
-            font=("Arial", 12)
+            engine_frame, textvariable=self.engine_var,
+            state="readonly", width=35, font=("Helvetica", 12),
         )
         self.engine_combo.pack(side=tk.LEFT, padx=5)
         self.engine_combo.bind('<<ComboboxSelected>>', self.on_engine_change)
-        
-        self.engine_status = tk.Label(engine_frame, text="", font=("Arial", 11))
+
+        self.engine_status = tk.Label(
+            engine_frame, text="", font=("Helvetica", 11),
+            fg=self.FG_DIM, bg=self.BG,
+        )
         self.engine_status.pack(side=tk.LEFT, padx=15)
-        
-        # Download button for Piper (hidden by default)
-        if sys.platform == "darwin":  # macOS
-            self.download_button = tk.Button(
-                engine_frame,
-                text="Download Voice Model",
-                command=self.download_piper_model,
-                font=("Arial", 11),
-                highlightbackground="#2196F3"
-            )
-        else:
-            self.download_button = tk.Button(
-                engine_frame,
-                text="Download Voice Model",
-                command=self.download_piper_model,
-                bg="#2196F3",
-                fg="white",
-                font=("Arial", 11),
-                cursor="hand2"
-            )
-        
-        # Text area
-        text_label = tk.Label(main_frame, text="Enter text to speak:", font=("Arial", 14))
-        text_label.pack(pady=(15, 5), anchor='w')
-        
-        text_frame = tk.Frame(main_frame)
-        text_frame.pack(padx=5, pady=5, expand=True, fill='both')
-        
+
+        self.download_button = tk.Button(
+            engine_frame, text="Download Voice Model",
+            command=self.download_piper_model,
+            font=("Helvetica", 10, "bold"),
+            bg=self.ACCENT_BLUE, fg="white",
+            activebackground="#1976D2", activeforeground="white",
+            relief=tk.FLAT, padx=12, pady=4, cursor="hand2",
+        )
+
+        # ── Text area card ──
+        tk.Label(
+            main_frame, text="Enter text to speak:",
+            font=("Helvetica", 13, "bold"), fg=self.FG, bg=self.BG,
+        ).pack(pady=(12, 4), anchor='w')
+
+        text_card = tk.Frame(main_frame, bg=self.BG_CARD, padx=3, pady=3)
+        text_card.pack(padx=0, pady=2, expand=True, fill='both')
+
         self.text_area = scrolledtext.ScrolledText(
-            text_frame,
-            wrap=tk.WORD,
-            font=("Arial", 12),
-            relief=tk.FLAT,
-            borderwidth=2,
-            highlightthickness=1
+            text_card, wrap=tk.WORD,
+            font=("Menlo" if sys.platform == "darwin" else "Consolas", 12),
+            bg=self.BG_LIGHT, fg=self.FG,
+            insertbackground=self.FG,
+            selectbackground=self.ACCENT_BLUE, selectforeground="white",
+            relief=tk.FLAT, borderwidth=0, highlightthickness=0,
+            padx=12, pady=10,
         )
         self.text_area.pack(expand=True, fill='both')
-        self.text_area.tag_configure("current_sentence", background="#FFEB3B")
+        self.text_area.tag_configure("current_sentence", background=self.HIGHLIGHT, foreground="#FFFFFF")
 
-        # Controls frame
-        controls_frame = tk.Frame(main_frame)
-        controls_frame.pack(pady=20)
-        
+        # ── Controls area ──
+        controls_frame = tk.Frame(main_frame, bg=self.BG)
+        controls_frame.pack(pady=(12, 0), fill='x')
+
         # Language selection (for Google TTS)
-        self.lang_frame = tk.Frame(controls_frame)
-        
-        lang_label = tk.Label(self.lang_frame, text="Language:", font=("Arial", 12))
-        lang_label.pack(side=tk.LEFT, padx=10)
-        
+        self.lang_frame = tk.Frame(controls_frame, bg=self.BG)
+
+        tk.Label(
+            self.lang_frame, text="Language:", font=("Helvetica", 12),
+            fg=self.FG, bg=self.BG,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+
         self.lang_var = tk.StringVar(value="en")
         languages = [
-            ("English", "en"),
-            ("Spanish", "es"),
-            ("French", "fr"),
-            ("German", "de"),
-            ("Italian", "it"),
-            ("Portuguese", "pt"),
-            ("Russian", "ru"),
-            ("Japanese", "ja"),
-            ("Korean", "ko"),
-            ("Chinese", "zh")
+            ("English", "en"), ("Spanish", "es"), ("French", "fr"),
+            ("German", "de"), ("Italian", "it"), ("Portuguese", "pt"),
+            ("Russian", "ru"), ("Japanese", "ja"), ("Korean", "ko"),
+            ("Chinese", "zh"),
         ]
-        
         self.lang_combo = ttk.Combobox(
-            self.lang_frame,
-            textvariable=self.lang_var,
+            self.lang_frame, textvariable=self.lang_var,
             values=[f"{name} ({code})" for name, code in languages],
-            state="readonly",
-            width=25,
-            font=("Arial", 11)
+            state="readonly", width=25, font=("Helvetica", 11),
         )
         self.lang_combo.set("English (en)")
-        self.lang_combo.pack(side=tk.LEFT, padx=10)
-        
+        self.lang_combo.pack(side=tk.LEFT, padx=5)
+
         # Speed control
-        speed_frame = tk.Frame(controls_frame)
-        speed_frame.pack(pady=15)
-        
-        speed_label = tk.Label(speed_frame, text="Speed:", font=("Arial", 12))
-        speed_label.pack(side=tk.LEFT, padx=10)
-        
+        speed_frame = tk.Frame(controls_frame, bg=self.BG)
+        speed_frame.pack(pady=8)
+
+        tk.Label(
+            speed_frame, text="Speed:", font=("Helvetica", 12),
+            fg=self.FG, bg=self.BG,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+
         self.speed_var = tk.DoubleVar(value=1.5)
         self.speed_slider = tk.Scale(
-            speed_frame,
-            from_=0.5,
-            to=2.0,
-            resolution=0.1,
-            orient=tk.HORIZONTAL,
-            variable=self.speed_var,
-            length=300,
-            command=self.update_speed_label,
-            showvalue=False
+            speed_frame, from_=0.5, to=2.0, resolution=0.1,
+            orient=tk.HORIZONTAL, variable=self.speed_var,
+            length=300, command=self.update_speed_label, showvalue=False,
+            bg=self.BG, fg=self.FG, troughcolor=self.BG_LIGHT,
+            highlightthickness=0, activebackground=self.ACCENT_BLUE,
         )
-        self.speed_slider.pack(side=tk.LEFT, padx=10)
-        
-        self.speed_label = tk.Label(speed_frame, text="1.5x", font=("Arial", 12))
+        self.speed_slider.pack(side=tk.LEFT, padx=8)
+
+        self.speed_label = tk.Label(
+            speed_frame, text="1.5x", font=("Helvetica", 13, "bold"),
+            fg=self.ACCENT_BLUE, bg=self.BG, width=5,
+        )
         self.speed_label.pack(side=tk.LEFT, padx=5)
-        
-        # Progress bar
-        progress_frame = tk.Frame(controls_frame)
-        progress_frame.pack(fill='x', pady=(10, 0))
+
+        # ── Progress bar ──
+        progress_frame = tk.Frame(controls_frame, bg=self.BG)
+        progress_frame.pack(fill='x', pady=(8, 2))
 
         self.progress_var = tk.IntVar(value=0)
         self.progress_scale = tk.Scale(
-            progress_frame,
-            from_=0,
-            to=1,
-            orient=tk.HORIZONTAL,
-            variable=self.progress_var,
-            showvalue=False,
-            command=self.on_progress_seek,
+            progress_frame, from_=0, to=1,
+            orient=tk.HORIZONTAL, variable=self.progress_var,
+            showvalue=False, command=self.on_progress_seek,
+            bg=self.BG, fg=self.FG, troughcolor=self.BG_LIGHT,
+            highlightthickness=0, activebackground=self.ACCENT_BLUE,
+            sliderlength=20, width=12,
         )
         self.progress_scale.pack(fill='x', expand=True)
 
-        self.progress_label = tk.Label(progress_frame, text="Sentence 0 / 0", font=("Arial", 10), fg="gray")
+        self.progress_label = tk.Label(
+            progress_frame, text="Sentence 0 / 0",
+            font=("Helvetica", 10), fg=self.FG_DIM, bg=self.BG,
+        )
         self.progress_label.pack()
 
-        # Transport controls
-        transport_frame = tk.Frame(controls_frame)
+        # ── Transport controls ──
+        transport_frame = tk.Frame(controls_frame, bg=self.BG)
         transport_frame.pack(pady=10)
 
-        btn_font = ("Arial", 14)
-        btn_width = 6
+        transport_btn_cfg = dict(
+            relief=tk.FLAT, cursor="hand2", borderwidth=0,
+            font=("Helvetica", 16, "bold"), width=4, height=1,
+            activeforeground="white", padx=10, pady=6,
+        )
 
-        self.prev_button = tk.Button(transport_frame, text="|◁", font=btn_font, width=btn_width, command=self.on_prev)
-        self.prev_button.pack(side=tk.LEFT, padx=5)
+        self.prev_button = tk.Button(
+            transport_frame, text="⏮", bg=self.ACCENT_BLUE, fg="white",
+            activebackground="#1976D2", command=self.on_prev, **transport_btn_cfg,
+        )
+        self.prev_button.pack(side=tk.LEFT, padx=4)
 
-        self.play_pause_button = tk.Button(transport_frame, text="▶", font=("Arial", 16, "bold"), width=8, command=self.on_play_pause)
-        self.play_pause_button.pack(side=tk.LEFT, padx=5)
+        self.play_pause_button = tk.Button(
+            transport_frame, text="▶", bg=self.ACCENT_GREEN, fg="white",
+            activebackground="#388E3C", command=self.on_play_pause,
+            relief=tk.FLAT, cursor="hand2", borderwidth=0,
+            font=("Helvetica", 20, "bold"), width=5, height=1,
+            activeforeground="white", padx=14, pady=6,
+        )
+        self.play_pause_button.pack(side=tk.LEFT, padx=6)
 
-        self.stop_button = tk.Button(transport_frame, text="⏹", font=btn_font, width=btn_width, command=self.on_stop)
-        self.stop_button.pack(side=tk.LEFT, padx=5)
+        self.stop_button = tk.Button(
+            transport_frame, text="⏹", bg=self.ACCENT_RED, fg="white",
+            activebackground="#C62828", command=self.on_stop, **transport_btn_cfg,
+        )
+        self.stop_button.pack(side=tk.LEFT, padx=4)
 
-        self.next_button = tk.Button(transport_frame, text="▷|", font=btn_font, width=btn_width, command=self.on_next)
-        self.next_button.pack(side=tk.LEFT, padx=5)
+        self.next_button = tk.Button(
+            transport_frame, text="⏭", bg=self.ACCENT_BLUE, fg="white",
+            activebackground="#1976D2", command=self.on_next, **transport_btn_cfg,
+        )
+        self.next_button.pack(side=tk.LEFT, padx=4)
 
-        # Resume banner (hidden by default)
-        self.resume_frame = tk.Frame(main_frame, bg="#FFF9C4", padx=10, pady=5)
-        self.resume_label = tk.Label(self.resume_frame, text="", font=("Arial", 11), bg="#FFF9C4")
+        # ── Resume banner (hidden by default) ──
+        self.resume_frame = tk.Frame(main_frame, bg=self.BANNER_BG, padx=12, pady=6)
+        self.resume_label = tk.Label(
+            self.resume_frame, text="", font=("Helvetica", 11, "bold"),
+            bg=self.BANNER_BG, fg=self.BANNER_FG,
+        )
         self.resume_label.pack(side=tk.LEFT, padx=5)
-        self.resume_yes_btn = tk.Button(self.resume_frame, text="Resume", command=self.on_resume_yes, font=("Arial", 10))
+        self.resume_yes_btn = tk.Button(
+            self.resume_frame, text="Resume", command=self.on_resume_yes,
+            font=("Helvetica", 10, "bold"), bg=self.ACCENT_GREEN, fg="white",
+            relief=tk.FLAT, padx=10, pady=2, cursor="hand2",
+        )
         self.resume_yes_btn.pack(side=tk.LEFT, padx=5)
-        self.resume_no_btn = tk.Button(self.resume_frame, text="Start Over", command=self.on_resume_no, font=("Arial", 10))
+        self.resume_no_btn = tk.Button(
+            self.resume_frame, text="Start Over", command=self.on_resume_no,
+            font=("Helvetica", 10), bg=self.BG_LIGHT, fg=self.FG,
+            relief=tk.FLAT, padx=10, pady=2, cursor="hand2",
+        )
         self.resume_no_btn.pack(side=tk.LEFT, padx=5)
 
-        # Status
-        self.status_label = tk.Label(controls_frame, text="Checking engines...", fg="gray", font=("Arial", 11))
-        self.status_label.pack(pady=10)
+        # ── Status ──
+        self.status_label = tk.Label(
+            controls_frame, text="Checking engines...",
+            fg=self.FG_DIM, bg=self.BG, font=("Helvetica", 11),
+        )
+        self.status_label.pack(pady=8)
     
     def check_engines_and_initialize(self):
         """Check available engines and initialize"""
@@ -778,10 +827,10 @@ class UnifiedTTSApp:
                         break
             
             self.on_engine_change()
-            self.status_label.config(text="Ready", fg="green")
+            self.status_label.config(text="Ready", fg=self.ACCENT_GREEN)
         else:
             self.engine_combo.current(0)
-            self.status_label.config(text="No TTS engines available. Please install dependencies.", fg="red")
+            self.status_label.config(text="No TTS engines available. Please install dependencies.", fg=self.ACCENT_RED)
             self.play_pause_button.config(state="disabled")
     
     def on_engine_change(self, event=None):
@@ -795,38 +844,37 @@ class UnifiedTTSApp:
             self.current_engine = self.engines['google']
             self.lang_frame.pack(pady=10)
             self.play_pause_button.config(state="normal")
-            self.status_label.config(text="Ready - Google TTS", fg="green")
-            
+            self.status_label.config(text="Ready - Google TTS", fg=self.ACCENT_GREEN)
+
         elif "Piper TTS (Offline)" in selection:
             self.current_engine = self.engines['piper']
             self.lang_frame.pack_forget()
             self.play_pause_button.config(state="normal")
-            self.status_label.config(text="Ready - Piper TTS", fg="green")
-            
+            self.status_label.config(text="Ready - Piper TTS", fg=self.ACCENT_GREEN)
+
         elif "Model Not Downloaded" in selection:
             self.current_engine = None
             self.lang_frame.pack_forget()
             self.play_pause_button.config(state="disabled")
             self.download_button.pack(side=tk.LEFT, padx=20)
-            self.status_label.config(text="Download voice model to use Piper TTS", fg="orange")
-            
+            self.status_label.config(text="Download voice model to use Piper TTS", fg=self.ACCENT_ORANGE)
+
         else:
-            # Not available
             self.current_engine = None
             self.play_pause_button.config(state="disabled")
             if "Google" in selection:
-                self.status_label.config(text="Install: pip install gtts pygame", fg="orange")
+                self.status_label.config(text="Install: pip install gtts pygame", fg=self.ACCENT_ORANGE)
             else:
-                self.status_label.config(text="Install: pip install piper-tts", fg="orange")
+                self.status_label.config(text="Install: pip install piper-tts", fg=self.ACCENT_ORANGE)
     
     def download_piper_model(self):
         """Download Piper voice model"""
         self.download_button.config(state="disabled", text="Downloading...")
-        self.status_label.config(text="Downloading voice model...", fg="blue")
-        
+        self.status_label.config(text="Downloading voice model...", fg=self.ACCENT_BLUE)
+
         def download_thread():
             def update_status(msg):
-                self.root.after(0, lambda: self.status_label.config(text=msg, fg="blue"))
+                self.root.after(0, lambda: self.status_label.config(text=msg, fg=self.ACCENT_BLUE))
             
             success = self.engines['piper'].download_model(update_status)
             
@@ -901,8 +949,8 @@ class UnifiedTTSApp:
     def _start_playback(self):
         self.playback.state = PlaybackController.State.PLAYING
         self._stop_event.clear()
-        self.play_pause_button.config(text="⏸")
-        self.status_label.config(text="Speaking...", fg="blue")
+        self.play_pause_button.config(text="⏸", bg=self.ACCENT_ORANGE)
+        self.status_label.config(text="Speaking...", fg=self.ACCENT_BLUE)
         self._update_progress()
         self._playback_thread = threading.Thread(target=self._playback_loop, daemon=True)
         self._playback_thread.start()
@@ -912,8 +960,8 @@ class UnifiedTTSApp:
         self._stop_event.set()
         if PYGAME_AVAILABLE:
             pygame.mixer.music.stop()
-        self.play_pause_button.config(text="▶")
-        self.status_label.config(text="Paused", fg="orange")
+        self.play_pause_button.config(text="▶", bg=self.ACCENT_GREEN)
+        self.status_label.config(text="Paused", fg=self.ACCENT_ORANGE)
         self.playback.save_current_position(
             speed=self.speed_var.get(),
             engine_name=self.current_engine.get_name() if self.current_engine else "",
@@ -926,10 +974,10 @@ class UnifiedTTSApp:
             pygame.mixer.music.stop()
         self.playback.cleanup_buffer()
         self.playback.current_index = 0
-        self.play_pause_button.config(text="▶")
+        self.play_pause_button.config(text="▶", bg=self.ACCENT_GREEN)
         self.status_label.config(
             text=f"Ready - {self.current_engine.get_name()}" if self.current_engine else "Ready",
-            fg="green",
+            fg=self.ACCENT_GREEN,
         )
         self._clear_highlight()
         self._update_progress()
@@ -1043,14 +1091,14 @@ class UnifiedTTSApp:
             self.root.after(0, self._on_playback_finished)
 
     def _on_playback_finished(self):
-        self.play_pause_button.config(text="▶")
+        self.play_pause_button.config(text="▶", bg=self.ACCENT_GREEN)
         self._clear_highlight()
         self.playback.cleanup_buffer()
         if self.playback.session_store:
             self.playback.session_store.delete_position(self.playback.original_text)
         self.status_label.config(
             text=f"Ready - {self.current_engine.get_name()}" if self.current_engine else "Ready",
-            fg="green",
+            fg=self.ACCENT_GREEN,
         )
 
     def _highlight_current(self):

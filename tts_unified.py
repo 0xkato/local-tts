@@ -5,6 +5,9 @@ Supports Google TTS and Piper TTS engines
 """
 
 import re
+import hashlib
+import json
+import time
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
 import threading
@@ -133,6 +136,73 @@ class SentenceSplitter:
     def split(self, text: str) -> list[str]:
         positions = self.get_positions(text)
         return [text[start:end] for start, end in positions]
+
+
+class SessionStore:
+    """Persistent storage for playback positions, keyed by text hash."""
+
+    def __init__(self, base_dir=None):
+        if base_dir is None:
+            base_dir = os.path.expanduser("~/.local/share/local-tts")
+        self.base_dir = base_dir
+        os.makedirs(self.base_dir, exist_ok=True)
+        self.sessions_file = os.path.join(self.base_dir, "sessions.json")
+
+    def _text_hash(self, text: str) -> str:
+        """SHA256 of first 500 chars, truncated to 16 hex chars."""
+        return hashlib.sha256(text[:500].encode("utf-8")).hexdigest()[:16]
+
+    def _load_sessions(self) -> dict:
+        """Read sessions.json and return dict."""
+        if not os.path.exists(self.sessions_file):
+            return {}
+        try:
+            with open(self.sessions_file, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return {}
+
+    def _save_sessions(self, sessions: dict) -> None:
+        """Write sessions dict to sessions.json."""
+        with open(self.sessions_file, "w", encoding="utf-8") as f:
+            json.dump(sessions, f, indent=2)
+
+    def save_position(self, text: str, sentence_index: int, speed: float, engine: str) -> None:
+        """Save playback position with timestamp."""
+        sessions = self._load_sessions()
+        key = self._text_hash(text)
+        sessions[key] = {
+            "sentence_index": sentence_index,
+            "speed": speed,
+            "engine": engine,
+            "timestamp": time.time(),
+        }
+        self._save_sessions(sessions)
+
+    def load_position(self, text: str) -> dict | None:
+        """Return saved position dict or None."""
+        sessions = self._load_sessions()
+        return sessions.get(self._text_hash(text))
+
+    def delete_position(self, text: str) -> None:
+        """Remove saved position for the given text."""
+        sessions = self._load_sessions()
+        key = self._text_hash(text)
+        if key in sessions:
+            del sessions[key]
+            self._save_sessions(sessions)
+
+    def prune_old(self, max_age_days: int = 30, max_sessions: int = 50) -> None:
+        """Remove sessions older than max_age_days and keep at most max_sessions."""
+        sessions = self._load_sessions()
+        cutoff = time.time() - (max_age_days * 86400)
+        # Remove expired sessions
+        sessions = {k: v for k, v in sessions.items() if v.get("timestamp", 0) >= cutoff}
+        # If still over limit, keep the most recent
+        if len(sessions) > max_sessions:
+            sorted_keys = sorted(sessions, key=lambda k: sessions[k].get("timestamp", 0), reverse=True)
+            sessions = {k: sessions[k] for k in sorted_keys[:max_sessions]}
+        self._save_sessions(sessions)
 
 
 class TTSEngine(ABC):

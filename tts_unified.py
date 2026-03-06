@@ -511,14 +511,14 @@ class UnifiedTTSApp:
         self.root.title("Text to Speech")
         self.root.configure(bg=self.BG)
 
-        # Window size
-        width, height = 900, 720
+        # Window size — tall enough to fit all controls without squishing
+        width, height = 950, 820
         self.root.geometry(f"{width}x{height}")
         self.root.update_idletasks()
         x = (self.root.winfo_screenwidth() // 2) - (width // 2)
         y = (self.root.winfo_screenheight() // 2) - (height // 2)
         self.root.geometry(f"{width}x{height}+{x}+{y}")
-        self.root.minsize(800, 600)
+        self.root.minsize(850, 750)
 
         self._setup_theme()
 
@@ -644,9 +644,9 @@ class UnifiedTTSApp:
         self.text_area.pack(expand=True, fill='both')
         self.text_area.tag_configure("current_sentence", background=self.HIGHLIGHT, foreground="#FFFFFF")
 
-        # ── Controls area ──
+        # ── Controls area (fixed height — text area gets remaining space) ──
         controls_frame = tk.Frame(main_frame, bg=self.BG)
-        controls_frame.pack(pady=(12, 0), fill='x')
+        controls_frame.pack(pady=(12, 0), fill='x', expand=False)
 
         # Language selection (for Google TTS)
         self.lang_frame = tk.Frame(controls_frame, bg=self.BG)

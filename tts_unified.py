@@ -532,11 +532,15 @@ class UnifiedTTSApp:
         }
         
         self.current_engine = None
-        self.is_speaking = False
-        self.speaking_thread = None
-        
+        self.session_store = SessionStore()
+        self.session_store.prune_old()
+        self.playback = PlaybackController(session_store=self.session_store)
+        self._playback_thread = None
+        self._stop_event = threading.Event()
+
         self.create_ui()
         self.check_engines_and_initialize()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
     
     def create_ui(self):
         """Create the user interface"""
@@ -547,7 +551,8 @@ class UnifiedTTSApp:
         else:
             main_frame = tk.Frame(self.root, padx=40, pady=30)
         main_frame.pack(expand=True, fill='both')
-        
+        self.main_frame = main_frame
+
         # Title
         title_frame = tk.Frame(main_frame)
         title_frame.pack(pady=(0, 20))
@@ -615,7 +620,8 @@ class UnifiedTTSApp:
             highlightthickness=1
         )
         self.text_area.pack(expand=True, fill='both')
-        
+        self.text_area.tag_configure("current_sentence", background="#FFEB3B")
+
         # Controls frame
         controls_frame = tk.Frame(main_frame)
         controls_frame.pack(pady=20)
@@ -658,7 +664,7 @@ class UnifiedTTSApp:
         speed_label = tk.Label(speed_frame, text="Speed:", font=("Arial", 12))
         speed_label.pack(side=tk.LEFT, padx=10)
         
-        self.speed_var = tk.DoubleVar(value=1.0)
+        self.speed_var = tk.DoubleVar(value=1.5)
         self.speed_slider = tk.Scale(
             speed_frame,
             from_=0.5,
@@ -672,37 +678,56 @@ class UnifiedTTSApp:
         )
         self.speed_slider.pack(side=tk.LEFT, padx=10)
         
-        self.speed_label = tk.Label(speed_frame, text="1.0x", font=("Arial", 12))
+        self.speed_label = tk.Label(speed_frame, text="1.5x", font=("Arial", 12))
         self.speed_label.pack(side=tk.LEFT, padx=5)
         
-        # Buttons
-        button_frame = tk.Frame(controls_frame)
-        button_frame.pack(pady=20)
-        
-        if sys.platform == "darwin":  # macOS
-            self.play_button = tk.Button(
-                button_frame,
-                text="▶ PLAY",
-                command=self.toggle_play,
-                font=("Arial", 16, "bold"),
-                width=20,
-                height=2,
-                highlightbackground="#4CAF50"
-            )
-        else:
-            self.play_button = tk.Button(
-                button_frame,
-                text="▶ PLAY",
-                command=self.toggle_play,
-                bg="#4CAF50",
-                fg="white",
-                font=("Arial", 16, "bold"),
-                width=20,
-                height=2,
-                cursor="hand2"
-            )
-        self.play_button.pack()
-        
+        # Progress bar
+        progress_frame = tk.Frame(controls_frame)
+        progress_frame.pack(fill='x', pady=(10, 0))
+
+        self.progress_var = tk.IntVar(value=0)
+        self.progress_scale = tk.Scale(
+            progress_frame,
+            from_=0,
+            to=1,
+            orient=tk.HORIZONTAL,
+            variable=self.progress_var,
+            showvalue=False,
+            command=self.on_progress_seek,
+        )
+        self.progress_scale.pack(fill='x', expand=True)
+
+        self.progress_label = tk.Label(progress_frame, text="Sentence 0 / 0", font=("Arial", 10), fg="gray")
+        self.progress_label.pack()
+
+        # Transport controls
+        transport_frame = tk.Frame(controls_frame)
+        transport_frame.pack(pady=10)
+
+        btn_font = ("Arial", 14)
+        btn_width = 6
+
+        self.prev_button = tk.Button(transport_frame, text="|◁", font=btn_font, width=btn_width, command=self.on_prev)
+        self.prev_button.pack(side=tk.LEFT, padx=5)
+
+        self.play_pause_button = tk.Button(transport_frame, text="▶", font=("Arial", 16, "bold"), width=8, command=self.on_play_pause)
+        self.play_pause_button.pack(side=tk.LEFT, padx=5)
+
+        self.stop_button = tk.Button(transport_frame, text="⏹", font=btn_font, width=btn_width, command=self.on_stop)
+        self.stop_button.pack(side=tk.LEFT, padx=5)
+
+        self.next_button = tk.Button(transport_frame, text="▷|", font=btn_font, width=btn_width, command=self.on_next)
+        self.next_button.pack(side=tk.LEFT, padx=5)
+
+        # Resume banner (hidden by default)
+        self.resume_frame = tk.Frame(main_frame, bg="#FFF9C4", padx=10, pady=5)
+        self.resume_label = tk.Label(self.resume_frame, text="", font=("Arial", 11), bg="#FFF9C4")
+        self.resume_label.pack(side=tk.LEFT, padx=5)
+        self.resume_yes_btn = tk.Button(self.resume_frame, text="Resume", command=self.on_resume_yes, font=("Arial", 10))
+        self.resume_yes_btn.pack(side=tk.LEFT, padx=5)
+        self.resume_no_btn = tk.Button(self.resume_frame, text="Start Over", command=self.on_resume_no, font=("Arial", 10))
+        self.resume_no_btn.pack(side=tk.LEFT, padx=5)
+
         # Status
         self.status_label = tk.Label(controls_frame, text="Checking engines...", fg="gray", font=("Arial", 11))
         self.status_label.pack(pady=10)
@@ -757,7 +782,7 @@ class UnifiedTTSApp:
         else:
             self.engine_combo.current(0)
             self.status_label.config(text="No TTS engines available. Please install dependencies.", fg="red")
-            self.play_button.config(state="disabled")
+            self.play_pause_button.config(state="disabled")
     
     def on_engine_change(self, event=None):
         """Handle engine selection change"""
@@ -769,26 +794,26 @@ class UnifiedTTSApp:
         if "Google TTS (Online)" in selection:
             self.current_engine = self.engines['google']
             self.lang_frame.pack(pady=10)
-            self.play_button.config(state="normal")
+            self.play_pause_button.config(state="normal")
             self.status_label.config(text="Ready - Google TTS", fg="green")
             
         elif "Piper TTS (Offline)" in selection:
             self.current_engine = self.engines['piper']
             self.lang_frame.pack_forget()
-            self.play_button.config(state="normal")
+            self.play_pause_button.config(state="normal")
             self.status_label.config(text="Ready - Piper TTS", fg="green")
             
         elif "Model Not Downloaded" in selection:
             self.current_engine = None
             self.lang_frame.pack_forget()
-            self.play_button.config(state="disabled")
+            self.play_pause_button.config(state="disabled")
             self.download_button.pack(side=tk.LEFT, padx=20)
             self.status_label.config(text="Download voice model to use Piper TTS", fg="orange")
             
         else:
             # Not available
             self.current_engine = None
-            self.play_button.config(state="disabled")
+            self.play_pause_button.config(state="disabled")
             if "Google" in selection:
                 self.status_label.config(text="Install: pip install gtts pygame", fg="orange")
             else:
@@ -831,71 +856,250 @@ class UnifiedTTSApp:
         speed = float(value)
         self.speed_label.config(text=f"{speed:.1f}x")
     
-    def toggle_play(self):
-        """Toggle between play and stop"""
-        if self.is_speaking:
-            self.stop_speaking()
-        else:
+    def on_play_pause(self):
+        if self.playback.state == PlaybackController.State.STOPPED:
             text = self.text_area.get("1.0", tk.END).strip()
-            if text:
-                self.play_text(text)
-            else:
+            if not text:
                 messagebox.showwarning("No Text", "Please enter some text to speak")
-    
-    def play_text(self, text):
-        """Play the text using the selected engine"""
-        if not self.current_engine or not self.current_engine.is_available():
-            messagebox.showerror("Error", "Selected TTS engine is not available")
-            return
-        
-        self.is_speaking = True
-        if sys.platform == "darwin":
-            self.play_button.config(text="⏹ STOP")
-        else:
-            self.play_button.config(text="⏹ STOP", bg="#f44336")
+                return
+            if not self.current_engine or not self.current_engine.is_available():
+                messagebox.showerror("Error", "Selected TTS engine is not available")
+                return
+            self.playback.engine = self.current_engine
+            self.playback.load_text(text)
+            saved = self.playback.check_saved_position()
+            if saved and saved["sentence_index"] > 0:
+                self._show_resume_banner(saved)
+                return
+            self._start_playback()
+        elif self.playback.state == PlaybackController.State.PLAYING:
+            self._pause_playback()
+        elif self.playback.state == PlaybackController.State.PAUSED:
+            self._start_playback()
+
+    def _show_resume_banner(self, saved):
+        idx = saved["sentence_index"]
+        total = self.playback.total_sentences
+        self.resume_label.config(text=f"Resume from sentence {idx + 1}/{total}?")
+        self.resume_frame.pack(fill='x', pady=(5, 0))
+
+    def on_resume_yes(self):
+        saved = self.playback.check_saved_position()
+        if saved:
+            self.playback.seek_to(saved["sentence_index"])
+            if "speed" in saved:
+                self.speed_var.set(saved["speed"])
+                self.speed_label.config(text=f"{saved['speed']:.1f}x")
+        self.resume_frame.pack_forget()
+        self._start_playback()
+
+    def on_resume_no(self):
+        self.resume_frame.pack_forget()
+        self.playback.seek_to(0)
+        self._start_playback()
+
+    def _start_playback(self):
+        self.playback.state = PlaybackController.State.PLAYING
+        self._stop_event.clear()
+        self.play_pause_button.config(text="⏸")
         self.status_label.config(text="Speaking...", fg="blue")
-        
-        # Get language if using Google TTS
-        kwargs = {'speed': self.speed_var.get(), 'callback': self.reset_ui}
-        if isinstance(self.current_engine, GoogleTTSEngine):
-            lang_code = self.lang_combo.get().split("(")[1].split(")")[0]
-            kwargs['language'] = lang_code
-        
-        # Start speaking in a separate thread
-        self.speaking_thread = threading.Thread(
-            target=lambda: self.speak_with_error_handling(text, **kwargs)
+        self._update_progress()
+        self._playback_thread = threading.Thread(target=self._playback_loop, daemon=True)
+        self._playback_thread.start()
+
+    def _pause_playback(self):
+        self.playback.state = PlaybackController.State.PAUSED
+        self._stop_event.set()
+        if PYGAME_AVAILABLE:
+            pygame.mixer.music.stop()
+        self.play_pause_button.config(text="▶")
+        self.status_label.config(text="Paused", fg="orange")
+        self.playback.save_current_position(
+            speed=self.speed_var.get(),
+            engine_name=self.current_engine.get_name() if self.current_engine else "",
         )
-        self.speaking_thread.daemon = True
-        self.speaking_thread.start()
-    
-    def speak_with_error_handling(self, text, **kwargs):
-        """Speak with error handling"""
+
+    def on_stop(self):
+        self.playback.state = PlaybackController.State.STOPPED
+        self._stop_event.set()
+        if PYGAME_AVAILABLE:
+            pygame.mixer.music.stop()
+        self.playback.cleanup_buffer()
+        self.playback.current_index = 0
+        self.play_pause_button.config(text="▶")
+        self.status_label.config(
+            text=f"Ready - {self.current_engine.get_name()}" if self.current_engine else "Ready",
+            fg="green",
+        )
+        self._clear_highlight()
+        self._update_progress()
+
+    def on_prev(self):
+        was_playing = self.playback.state == PlaybackController.State.PLAYING
+        if was_playing:
+            self._stop_event.set()
+            if PYGAME_AVAILABLE:
+                pygame.mixer.music.stop()
+        self.playback.prev_sentence()
+        self._update_progress()
+        self._highlight_current()
+        if was_playing:
+            self._stop_event.clear()
+            self._playback_thread = threading.Thread(target=self._playback_loop, daemon=True)
+            self._playback_thread.start()
+
+    def on_next(self):
+        was_playing = self.playback.state == PlaybackController.State.PLAYING
+        if was_playing:
+            self._stop_event.set()
+            if PYGAME_AVAILABLE:
+                pygame.mixer.music.stop()
+        self.playback.next_sentence()
+        self._update_progress()
+        self._highlight_current()
+        if was_playing:
+            self._stop_event.clear()
+            self._playback_thread = threading.Thread(target=self._playback_loop, daemon=True)
+            self._playback_thread.start()
+
+    def on_progress_seek(self, value):
+        if self.playback.total_sentences > 0:
+            idx = int(float(value))
+            if idx != self.playback.current_index:
+                was_playing = self.playback.state == PlaybackController.State.PLAYING
+                if was_playing:
+                    self._stop_event.set()
+                    if PYGAME_AVAILABLE:
+                        pygame.mixer.music.stop()
+                self.playback.seek_to(idx)
+                self._highlight_current()
+                self._update_progress_label()
+                if was_playing:
+                    self._stop_event.clear()
+                    self._playback_thread = threading.Thread(target=self._playback_loop, daemon=True)
+                    self._playback_thread.start()
+
+    def _playback_loop(self):
         try:
-            self.current_engine.speak(text, **kwargs)
+            while (
+                self.playback.state == PlaybackController.State.PLAYING
+                and self.playback.current_index < self.playback.total_sentences
+                and not self._stop_event.is_set()
+            ):
+                idx = self.playback.current_index
+                speed = self.speed_var.get()
+
+                kwargs = {}
+                if isinstance(self.current_engine, GoogleTTSEngine):
+                    lang_code = self.lang_combo.get().split("(")[1].split(")")[0]
+                    kwargs["language"] = lang_code
+
+                try:
+                    audio_path = self.playback.generate_sentence(idx, speed, **kwargs)
+                except Exception as e:
+                    self.root.after(0, lambda e=e: messagebox.showerror("Error", f"Generation failed: {e}"))
+                    break
+
+                if self._stop_event.is_set():
+                    break
+
+                # Lookahead: pre-generate next sentence
+                if idx + 1 < self.playback.total_sentences:
+                    lookahead = threading.Thread(
+                        target=self.playback.generate_sentence,
+                        args=(idx + 1, speed),
+                        kwargs=kwargs,
+                        daemon=True,
+                    )
+                    lookahead.start()
+
+                self.root.after(0, self._highlight_current)
+                self.root.after(0, self._update_progress)
+
+                if audio_path and os.path.exists(audio_path) and PYGAME_AVAILABLE:
+                    pygame.mixer.music.load(audio_path)
+                    pygame.mixer.music.play()
+                    while pygame.mixer.music.get_busy() and not self._stop_event.is_set():
+                        pygame.time.Clock().tick(10)
+
+                if self._stop_event.is_set():
+                    break
+
+                self.playback.save_current_position(
+                    speed=speed,
+                    engine_name=self.current_engine.get_name() if self.current_engine else "",
+                )
+
+                if self.playback.current_index < self.playback.total_sentences - 1:
+                    self.playback.current_index += 1
+                else:
+                    break
+
+            if self.playback.state == PlaybackController.State.PLAYING:
+                self.playback.state = PlaybackController.State.STOPPED
+                self.root.after(0, self._on_playback_finished)
         except Exception as e:
-            self.root.after(0, lambda: messagebox.showerror("Error", f"Failed to speak: {str(e)}"))
-            self.root.after(0, self.reset_ui)
-    
-    def stop_speaking(self):
-        """Stop the current speech"""
-        self.is_speaking = False
-        if self.current_engine:
-            self.current_engine.stop()
-        self.reset_ui()
-    
-    def reset_ui(self):
-        """Reset UI to ready state"""
-        self.is_speaking = False
-        if sys.platform == "darwin":
-            self.play_button.config(text="▶ PLAY")
+            self.root.after(0, lambda e=e: messagebox.showerror("Error", f"Playback failed: {e}"))
+            self.root.after(0, self._on_playback_finished)
+
+    def _on_playback_finished(self):
+        self.play_pause_button.config(text="▶")
+        self._clear_highlight()
+        self.playback.cleanup_buffer()
+        if self.playback.session_store:
+            self.playback.session_store.delete_position(self.playback.original_text)
+        self.status_label.config(
+            text=f"Ready - {self.current_engine.get_name()}" if self.current_engine else "Ready",
+            fg="green",
+        )
+
+    def _highlight_current(self):
+        self._clear_highlight()
+        if not self.playback.positions or self.playback.current_index >= len(self.playback.positions):
+            return
+        start, end = self.playback.positions[self.playback.current_index]
+        text_content = self.playback.original_text
+        line = text_content[:start].count('\n') + 1
+        col = start - text_content[:start].rfind('\n') - 1
+        end_line = text_content[:end].count('\n') + 1
+        end_col = end - text_content[:end].rfind('\n') - 1
+        start_idx = f"{line}.{col}"
+        end_idx = f"{end_line}.{end_col}"
+        self.text_area.tag_add("current_sentence", start_idx, end_idx)
+        self.text_area.see(start_idx)
+
+    def _clear_highlight(self):
+        self.text_area.tag_remove("current_sentence", "1.0", tk.END)
+
+    def _update_progress(self):
+        total = self.playback.total_sentences
+        if total > 0:
+            self.progress_scale.config(to=max(total - 1, 1))
+            self.progress_var.set(self.playback.current_index)
         else:
-            self.play_button.config(text="▶ PLAY", bg="#4CAF50")
-        
-        if self.current_engine:
-            engine_name = self.current_engine.get_name()
-            self.status_label.config(text=f"Ready - {engine_name}", fg="green")
-        else:
-            self.status_label.config(text="Ready", fg="green")
+            self.progress_scale.config(to=1)
+            self.progress_var.set(0)
+        self._update_progress_label()
+
+    def _update_progress_label(self):
+        total = self.playback.total_sentences
+        current = self.playback.current_index + 1 if total > 0 else 0
+        self.progress_label.config(text=f"Sentence {current} / {total}")
+
+    def _on_close(self):
+        if self.playback.state != PlaybackController.State.STOPPED:
+            self.playback.save_current_position(
+                speed=self.speed_var.get(),
+                engine_name=self.current_engine.get_name() if self.current_engine else "",
+            )
+        self._stop_event.set()
+        if PYGAME_AVAILABLE:
+            try:
+                pygame.mixer.music.stop()
+            except:
+                pass
+        self.playback.cleanup()
+        self.root.destroy()
 
 
 def check_dependencies():

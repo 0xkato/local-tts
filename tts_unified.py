@@ -4,6 +4,7 @@ Unified Text-to-Speech Application
 Supports Google TTS and Piper TTS engines
 """
 
+import re
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
 import threading
@@ -26,6 +27,112 @@ try:
     PYGAME_AVAILABLE = True
 except ImportError:
     PYGAME_AVAILABLE = False
+
+
+class SentenceSplitter:
+    """Splits text into sentences, respecting abbreviations and ellipses."""
+
+    ABBREVIATIONS = {
+        'mr', 'mrs', 'ms', 'dr', 'prof', 'sr', 'jr', 'st', 'ave', 'blvd',
+        'dept', 'est', 'fig', 'ft', 'gen', 'gov', 'inc', 'lt', 'mt', 'no',
+        'sgt', 'vs',
+    }
+
+    # Abbreviations with internal dots like u.s, e.g, i.e
+    DOTTED_ABBREVIATIONS = {'u.s', 'e.g', 'i.e'}
+
+    def get_positions(self, text: str) -> list[tuple[int, int]]:
+        if not text or not text.strip():
+            return []
+
+        positions = []
+        # Replace ellipses with a placeholder to avoid splitting on them
+        # We need to work on the original text for positions, so track splits manually
+        n = len(text)
+        i = 0
+        sentence_start = None
+
+        while i < n:
+            # Skip leading whitespace before a sentence
+            if sentence_start is None:
+                if text[i].isspace():
+                    i += 1
+                    continue
+                sentence_start = i
+
+            # Check for ellipsis (3+ dots)
+            if text[i] == '.' and i + 2 < n and text[i + 1] == '.' and text[i + 2] == '.':
+                # Skip all dots in the ellipsis
+                while i < n and text[i] == '.':
+                    i += 1
+                continue
+
+            if text[i] in '.!?':
+                # Check if this is an abbreviation
+                if text[i] == '.':
+                    # Check for dotted abbreviations like U.S.
+                    # Look back to find the start of a potential dotted abbreviation
+                    is_abbrev = False
+
+                    # Check standard abbreviations (word before the dot)
+                    # Find the word before the dot
+                    j = i - 1
+                    while j >= 0 and text[j].isalpha():
+                        j -= 1
+                    word = text[j + 1:i].lower()
+                    if word in self.ABBREVIATIONS:
+                        is_abbrev = True
+
+                    # Check dotted abbreviations like U.S.
+                    if not is_abbrev:
+                        # Look back for pattern like X.X. (e.g., U.S.)
+                        # Collect chars backwards
+                        j = i
+                        dotted = ''
+                        while j >= 0:
+                            if text[j] == '.':
+                                dotted = '.' + dotted
+                                j -= 1
+                            elif text[j].isalpha():
+                                dotted = text[j] + dotted
+                                j -= 1
+                            else:
+                                break
+                        # Remove trailing dot for matching
+                        dotted_lower = dotted.rstrip('.').lower()
+                        if dotted_lower in self.DOTTED_ABBREVIATIONS:
+                            is_abbrev = True
+
+                    if is_abbrev:
+                        i += 1
+                        continue
+
+                # This looks like a sentence-ending punctuation
+                # Check if followed by whitespace or end of string
+                end_pos = i + 1
+                if end_pos >= n or text[end_pos].isspace():
+                    # End of sentence found
+                    positions.append((sentence_start, end_pos))
+                    sentence_start = None
+                    i = end_pos
+                    continue
+
+            i += 1
+
+        # Handle remaining text (no terminal punctuation)
+        if sentence_start is not None:
+            # Trim trailing whitespace
+            end = n
+            while end > sentence_start and text[end - 1].isspace():
+                end -= 1
+            if end > sentence_start:
+                positions.append((sentence_start, end))
+
+        return positions
+
+    def split(self, text: str) -> list[str]:
+        positions = self.get_positions(text)
+        return [text[start:end] for start, end in positions]
 
 
 class TTSEngine(ABC):

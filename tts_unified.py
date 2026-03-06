@@ -207,22 +207,27 @@ class SessionStore:
 
 class TTSEngine(ABC):
     """Abstract base class for TTS engines"""
-    
+
+    @abstractmethod
+    def generate(self, text: str, speed: float, **kwargs) -> str:
+        """Generate audio file from text. Returns path to temp audio file."""
+        pass
+
     @abstractmethod
     def speak(self, text: str, speed: float, callback: Optional[Callable] = None) -> None:
         """Generate and play speech from text"""
         pass
-    
+
     @abstractmethod
     def stop(self) -> None:
         """Stop current speech playback"""
         pass
-    
+
     @abstractmethod
     def is_available(self) -> bool:
         """Check if this engine is available"""
         pass
-    
+
     @abstractmethod
     def get_name(self) -> str:
         """Get the display name of this engine"""
@@ -231,29 +236,35 @@ class TTSEngine(ABC):
 
 class GoogleTTSEngine(TTSEngine):
     """Google TTS using gTTS"""
-    
+
     def __init__(self):
         self.is_playing = False
         self.current_audio_file = None
         if PYGAME_AVAILABLE:
             pygame.mixer.init()
-    
+
+    def generate(self, text: str, speed: float, language: str = "en") -> str:
+        """Generate audio file from text. Returns path to temp audio file."""
+        if not GTTS_AVAILABLE:
+            raise Exception("gTTS not available")
+        tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+        tmp_file.close()
+        slow = speed < 1.0
+        tts = gTTS(text=text, lang=language, slow=slow)
+        tts.save(tmp_file.name)
+        return tmp_file.name
+
     def speak(self, text: str, speed: float, callback: Optional[Callable] = None, language: str = "en") -> None:
         if not GTTS_AVAILABLE or not PYGAME_AVAILABLE:
             raise Exception("gTTS or pygame not available")
-        
+
         self.is_playing = True
         try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp_file:
-                self.current_audio_file = tmp_file.name
-            
-            slow = speed < 1.0
-            tts = gTTS(text=text, lang=language, slow=slow)
-            tts.save(self.current_audio_file)
-            
+            self.current_audio_file = self.generate(text, speed, language=language)
+
             pygame.mixer.music.load(self.current_audio_file)
             pygame.mixer.music.play()
-            
+
             while pygame.mixer.music.get_busy() and self.is_playing:
                 pygame.time.Clock().tick(10)
         finally:
@@ -290,33 +301,36 @@ class PiperTTSEngine(TTSEngine):
         if PYGAME_AVAILABLE:
             pygame.mixer.init()
     
+    def generate(self, text: str, speed: float) -> str:
+        """Generate audio file from text. Returns path to temp audio file."""
+        if not self.is_available():
+            raise Exception("Piper TTS not available")
+        tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+        tmp_file.close()
+        length_scale = 1.0 / speed
+        process = subprocess.Popen(
+            ["piper", "--model", self.voice_model, "--output_file", tmp_file.name, "--length_scale", str(length_scale)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        stdout, stderr = process.communicate(input=text)
+        if process.returncode != 0:
+            raise Exception(f"Piper failed: {stderr}")
+        return tmp_file.name
+
     def speak(self, text: str, speed: float, callback: Optional[Callable] = None) -> None:
         if not self.is_available():
             raise Exception("Piper TTS not available")
-        
+
         self.is_playing = True
         try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_file:
-                self.current_audio_file = tmp_file.name
-            
-            length_scale = 1.0 / speed
-            
-            process = subprocess.Popen(
-                ["piper", "--model", self.voice_model, "--output_file", self.current_audio_file, "--length_scale", str(length_scale)],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
-            )
-            
-            stdout, stderr = process.communicate(input=text)
-            
-            if process.returncode != 0:
-                raise Exception(f"Piper failed: {stderr}")
-            
+            self.current_audio_file = self.generate(text, speed)
+
             pygame.mixer.music.load(self.current_audio_file)
             pygame.mixer.music.play()
-            
+
             while pygame.mixer.music.get_busy() and self.is_playing:
                 pygame.time.Clock().tick(10)
         finally:

@@ -712,7 +712,7 @@ class UnifiedTTSApp:
         self.progress_scale.pack(fill='x', expand=True)
 
         self.progress_label = tk.Label(
-            progress_frame, text="Sentence 0 / 0",
+            progress_frame, text="0%",
             font=("Helvetica", 10), fg=self.FG_DIM, bg=self.BG,
         )
         self.progress_label.pack()
@@ -798,9 +798,7 @@ class UnifiedTTSApp:
 
         canvas.bind("<Enter>", on_enter)
         canvas.bind("<Leave>", on_leave)
-        canvas.bind("<Button-1>", on_click)
-        canvas.tag_bind(rect_id, "<Button-1>", on_click)
-        canvas.tag_bind(text_id, "<Button-1>", on_click)
+        canvas.bind("<ButtonRelease-1>", on_click)
 
         return canvas
 
@@ -1199,8 +1197,11 @@ class UnifiedTTSApp:
 
     def _update_progress_label(self):
         total = self.playback.total_sentences
-        current = self.playback.current_index + 1 if total > 0 else 0
-        self.progress_label.config(text=f"Sentence {current} / {total}")
+        if total > 0:
+            pct = int(((self.playback.current_index + 1) / total) * 100)
+            self.progress_label.config(text=f"{pct}%")
+        else:
+            self.progress_label.config(text="0%")
 
     def _on_close(self):
         if self.playback.state != PlaybackController.State.STOPPED:

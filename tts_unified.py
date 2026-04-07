@@ -45,16 +45,36 @@ class SentenceSplitter:
     # Abbreviations with internal dots like u.s, e.g, i.e
     DOTTED_ABBREVIATIONS = {'u.s', 'e.g', 'i.e'}
 
+    # Characters that can follow sentence-ending punctuation (closing quotes/parens)
+    CLOSING_PUNCTUATION = {'"', "'", '\u201d', '\u2019', ')', ']', '\u00bb'}
+
+    def _is_numbered_list_dot(self, text: str, dot_pos: int) -> bool:
+        """Check if a dot at dot_pos is part of a numbered list marker like '1.' or '12.'
+
+        Only matches when the number is at the start of a line (possibly indented),
+        so 'He scored 3.' is NOT treated as a list marker.
+        """
+        # Walk back over digits
+        j = dot_pos - 1
+        while j >= 0 and text[j].isdigit():
+            j -= 1
+        if j == dot_pos - 1:
+            return False  # no digit before the dot
+        # Skip optional indentation (spaces/tabs)
+        while j >= 0 and text[j] in ' \t':
+            j -= 1
+        # Must be at start of string or right after a newline
+        return j < 0 or text[j] == '\n'
+
     def get_positions(self, text: str) -> list[tuple[int, int]]:
         if not text or not text.strip():
             return []
 
         positions = []
-        # Replace ellipses with a placeholder to avoid splitting on them
-        # We need to work on the original text for positions, so track splits manually
         n = len(text)
         i = 0
         sentence_start = None
+        in_list_item = False
 
         while i < n:
             # Skip leading whitespace before a sentence
@@ -63,6 +83,19 @@ class SentenceSplitter:
                     i += 1
                     continue
                 sentence_start = i
+                in_list_item = False
+
+            # Inside a list item, a newline ends the sentence (each line = one item)
+            if in_list_item and text[i] == '\n':
+                end = i
+                while end > sentence_start and text[end - 1].isspace():
+                    end -= 1
+                if end > sentence_start:
+                    positions.append((sentence_start, end))
+                sentence_start = None
+                in_list_item = False
+                i += 1
+                continue
 
             # Check for ellipsis (3+ dots)
             if text[i] == '.' and i + 2 < n and text[i + 1] == '.' and text[i + 2] == '.':
@@ -73,6 +106,19 @@ class SentenceSplitter:
 
             if text[i] in '.!?':
                 # Check if this is an abbreviation
+                if text[i] == '.':
+                    # Check for numbered list markers like "1.", "23."
+                    if self._is_numbered_list_dot(text, i):
+                        in_list_item = True
+                        i += 1
+                        continue
+
+                # Inside a list item: don't split on sentence punctuation —
+                # the whole item is one TTS unit, ended only by newline or EOF
+                if in_list_item:
+                    i += 1
+                    continue
+
                 if text[i] == '.':
                     # Check for dotted abbreviations like U.S.
                     # Look back to find the start of a potential dotted abbreviation
@@ -112,8 +158,11 @@ class SentenceSplitter:
                         continue
 
                 # This looks like a sentence-ending punctuation
-                # Check if followed by whitespace or end of string
+                # Include any closing punctuation that follows (quotes, parens)
                 end_pos = i + 1
+                while end_pos < n and text[end_pos] in self.CLOSING_PUNCTUATION:
+                    end_pos += 1
+
                 if end_pos >= n or text[end_pos].isspace():
                     # End of sentence found
                     positions.append((sentence_start, end_pos))
@@ -137,6 +186,59 @@ class SentenceSplitter:
     def split(self, text: str) -> list[str]:
         positions = self.get_positions(text)
         return [text[start:end] for start, end in positions]
+
+
+# Number-to-words for TTS normalization (0–999)
+_ONES = [
+    '', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine',
+    'ten', 'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen', 'sixteen',
+    'seventeen', 'eighteen', 'nineteen',
+]
+_TENS = ['', '', 'twenty', 'thirty', 'forty', 'fifty', 'sixty', 'seventy', 'eighty', 'ninety']
+
+
+def _int_to_words(n: int) -> str:
+    if n == 0:
+        return 'zero'
+    if n < 0:
+        return 'minus ' + _int_to_words(-n)
+    if n < 20:
+        return _ONES[n]
+    if n < 100:
+        return _TENS[n // 10] + ('' if n % 10 == 0 else ' ' + _ONES[n % 10])
+    if n < 1000:
+        return _ONES[n // 100] + ' hundred' + ('' if n % 100 == 0 else ' ' + _int_to_words(n % 100))
+    return str(n)  # leave large numbers as digits — TTS handles them fine in context
+
+
+def normalize_for_tts(text: str) -> str:
+    """Normalize text for better TTS pronunciation.
+
+    - Collapses internal whitespace (newlines from line-wrapped text) to single spaces
+    - Converts standalone integers (0–999) to words
+    - Strips numbered-list prefixes (e.g. '3. ' → 'three, ')
+    """
+    # Collapse whitespace first — line-wrapped text often has newlines mid-sentence
+    # which cause TTS engines to stutter or skip words
+    text = ' '.join(text.split())
+
+    # Replace numbered list prefixes at line/sentence start: "3. " → "three, "
+    def _replace_list_prefix(m):
+        n = int(m.group(1))
+        if 0 <= n <= 999:
+            return _int_to_words(n) + ',' + m.group(2)
+        return m.group(0)
+    text = re.sub(r'^(\d{1,3})\.([ \t])', _replace_list_prefix, text, flags=re.MULTILINE)
+
+    # Replace standalone integers surrounded by word boundaries
+    def _replace_number(m):
+        n = int(m.group(0))
+        if 0 <= n <= 999:
+            return _int_to_words(n)
+        return m.group(0)
+    text = re.sub(r'\b\d{1,3}\b', _replace_number, text)
+
+    return text
 
 
 class SessionStore:
@@ -241,8 +343,6 @@ class GoogleTTSEngine(TTSEngine):
     def __init__(self):
         self.is_playing = False
         self.current_audio_file = None
-        if PYGAME_AVAILABLE:
-            pygame.mixer.init()
 
     def generate(self, text: str, speed: float, language: str = "en") -> str:
         """Generate audio file from text. Returns path to temp audio file."""
@@ -299,10 +399,8 @@ class PiperTTSEngine(TTSEngine):
         self.piper_dir = os.path.expanduser("~/.local/share/piper")
         self.voice_model = os.path.join(self.piper_dir, "en_US-norman-medium.onnx")
         self.voice_config = os.path.join(self.piper_dir, "en_US-norman-medium.onnx.json")
-        if PYGAME_AVAILABLE:
-            pygame.mixer.init()
     
-    def generate(self, text: str, speed: float) -> str:
+    def generate(self, text: str, speed: float, **kwargs) -> str:
         """Generate audio file from text. Returns path to temp audio file."""
         if not self.is_available():
             raise Exception("Piper TTS not available")
@@ -455,7 +553,8 @@ class PlaybackController:
                 return self._buffer[index]
         if index < 0 or index >= self.total_sentences:
             return None
-        audio_path = self.engine.generate(self.sentences[index], speed, **kwargs)
+        sentence_text = normalize_for_tts(self.sentences[index])
+        audio_path = self.engine.generate(sentence_text, speed, **kwargs)
         with self._buffer_lock:
             self._buffer[index] = audio_path
         return audio_path
@@ -521,6 +620,10 @@ class UnifiedTTSApp:
         self.root.minsize(850, 750)
 
         self._setup_theme()
+
+        # Initialize pygame mixer once before creating any engines
+        if PYGAME_AVAILABLE:
+            pygame.mixer.init()
 
         # Initialize engines
         self.engines = {
@@ -972,8 +1075,8 @@ class UnifiedTTSApp:
         if getattr(self.play_pause_button, '_enabled', True) is False:
             return
         if self.playback.state == PlaybackController.State.STOPPED:
-            text = self.text_area.get("1.0", tk.END).strip()
-            if not text:
+            text = self.text_area.get("1.0", "end-1c")
+            if not text.strip():
                 messagebox.showwarning("No Text", "Please enter some text to speak")
                 return
             if not self.current_engine or not self.current_engine.is_available():
@@ -1216,6 +1319,8 @@ class UnifiedTTSApp:
             except:
                 pass
         self.playback.cleanup()
+        if PYGAME_AVAILABLE:
+            pygame.quit()
         self.root.destroy()
 
 

@@ -2,7 +2,7 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from tts_unified import SentenceSplitter
+from tts_unified import SentenceSplitter, normalize_for_tts
 
 
 class TestSentenceSplitter:
@@ -64,3 +64,76 @@ class TestSentenceSplitter:
         assert len(positions) == 2
         assert text[positions[0][0]:positions[0][1]] == "Hello world."
         assert text[positions[1][0]:positions[1][1]] == "How are you?"
+
+    # ── Numbered list tests ──
+
+    def test_numbered_list_not_split_at_marker(self):
+        """Each numbered list item becomes its own sentence."""
+        text = "1. First item\n2. Second item\n3. Third item"
+        result = self.splitter.split(text)
+        assert result == ["1. First item", "2. Second item", "3. Third item"]
+
+    def test_numbered_list_with_sentence_periods(self):
+        """List items that end with periods split correctly at the content period."""
+        text = "1. Do this thing.\n2. Do that thing.\n3. Done."
+        result = self.splitter.split(text)
+        assert result == ["1. Do this thing.", "2. Do that thing.", "3. Done."]
+
+    def test_numbered_list_with_internal_periods(self):
+        """Periods inside list items don't split the item — whole line is one sentence."""
+        text = "1. one. a bunch of text\n2. two. some more text\n3. three. some more text"
+        result = self.splitter.split(text)
+        assert result == [
+            "1. one. a bunch of text",
+            "2. two. some more text",
+            "3. three. some more text",
+        ]
+
+    def test_number_mid_sentence_still_splits(self):
+        """Numbers mid-sentence (not at line start) still split normally."""
+        text = "He scored 3. She scored 4."
+        result = self.splitter.split(text)
+        assert result == ["He scored 3.", "She scored 4."]
+
+    def test_decimal_not_split(self):
+        text = "The value is 3.14 exactly. Got it."
+        result = self.splitter.split(text)
+        assert result == ["The value is 3.14 exactly.", "Got it."]
+
+    # ── Closing punctuation tests ──
+
+    def test_closing_quote_after_period(self):
+        text = 'She said "hello." Then she left.'
+        result = self.splitter.split(text)
+        assert result == ['She said "hello."', "Then she left."]
+
+    def test_closing_paren_after_question(self):
+        text = "(Is this real?) Yes it is."
+        result = self.splitter.split(text)
+        assert result == ["(Is this real?)", "Yes it is."]
+
+
+class TestNormalizeForTTS:
+    def test_numbered_list_prefix(self):
+        assert normalize_for_tts("3. Walk the dog") == "three, Walk the dog"
+
+    def test_standalone_number(self):
+        result = normalize_for_tts("There are 5 options")
+        assert "five" in result
+
+    def test_large_numbers_left_alone(self):
+        result = normalize_for_tts("The year is 2024")
+        assert "2024" in result
+
+    def test_no_numbers(self):
+        assert normalize_for_tts("Hello world") == "Hello world"
+
+    def test_zero(self):
+        result = normalize_for_tts("The count is 0")
+        assert "zero" in result
+
+    def test_newlines_collapsed_to_spaces(self):
+        text = "At\nthe pixel level, the airplane is\ntiny."
+        result = normalize_for_tts(text)
+        assert "\n" not in result
+        assert "At the pixel level, the airplane is tiny." == result

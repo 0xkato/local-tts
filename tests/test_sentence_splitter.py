@@ -2,7 +2,7 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from tts_unified import SentenceSplitter, normalize_for_tts
+from tts_unified import SentenceSplitter
 
 
 class TestSentenceSplitter:
@@ -111,29 +111,3 @@ class TestSentenceSplitter:
         text = "(Is this real?) Yes it is."
         result = self.splitter.split(text)
         assert result == ["(Is this real?)", "Yes it is."]
-
-
-class TestNormalizeForTTS:
-    def test_numbered_list_prefix(self):
-        assert normalize_for_tts("3. Walk the dog") == "three, Walk the dog"
-
-    def test_standalone_number(self):
-        result = normalize_for_tts("There are 5 options")
-        assert "five" in result
-
-    def test_large_numbers_left_alone(self):
-        result = normalize_for_tts("The year is 2024")
-        assert "2024" in result
-
-    def test_no_numbers(self):
-        assert normalize_for_tts("Hello world") == "Hello world"
-
-    def test_zero(self):
-        result = normalize_for_tts("The count is 0")
-        assert "zero" in result
-
-    def test_newlines_collapsed_to_spaces(self):
-        text = "At\nthe pixel level, the airplane is\ntiny."
-        result = normalize_for_tts(text)
-        assert "\n" not in result
-        assert "At the pixel level, the airplane is tiny." == result

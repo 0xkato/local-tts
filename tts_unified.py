@@ -6,6 +6,7 @@ Supports Google TTS and Piper TTS engines
 
 import re
 import hashlib
+import math
 import json
 import time
 from enum import Enum
@@ -16,6 +17,7 @@ import os
 import sys
 import tempfile
 import subprocess
+import shutil
 from typing import Optional, Callable
 from abc import ABC, abstractmethod
 
@@ -48,23 +50,51 @@ class SentenceSplitter:
     # Characters that can follow sentence-ending punctuation (closing quotes/parens)
     CLOSING_PUNCTUATION = {'"', "'", '\u201d', '\u2019', ')', ']', '\u00bb'}
 
+    # Markers that start a line item: each such line is one TTS unit
+    BULLET_MARKERS = {'-', '*', '+', '\u2022', '\u25cf', '\u25aa'}
+    MAX_LIST_NUMBER_DIGITS = 3
+
+    def _at_line_start(self, text: str, pos: int) -> bool:
+        """True if only spaces/tabs sit between pos and the start of its line."""
+        j = pos - 1
+        while j >= 0 and text[j] in ' \t':
+            j -= 1
+        return j < 0 or text[j] == '\n'
+
     def _is_numbered_list_dot(self, text: str, dot_pos: int) -> bool:
         """Check if a dot at dot_pos is part of a numbered list marker like '1.' or '12.'
 
-        Only matches when the number is at the start of a line (possibly indented),
-        so 'He scored 3.' is NOT treated as a list marker.
+        Requires the number to start its line and the dot to be followed by
+        whitespace, so 'He scored 3.' is not a marker, and neither are the
+        decimals and years that open a paragraph -- '1.5x is fast.' and
+        '2024. What a year.' used to swallow their whole paragraph as one unit.
         """
         # Walk back over digits
         j = dot_pos - 1
         while j >= 0 and text[j].isdigit():
             j -= 1
-        if j == dot_pos - 1:
+        digits = dot_pos - 1 - j
+        if digits == 0:
             return False  # no digit before the dot
-        # Skip optional indentation (spaces/tabs)
-        while j >= 0 and text[j] in ' \t':
-            j -= 1
-        # Must be at start of string or right after a newline
-        return j < 0 or text[j] == '\n'
+        if digits > self.MAX_LIST_NUMBER_DIGITS:
+            return False  # a year or a long figure, not a list index
+        # A real marker is followed by a space; "1.5x" and "3.14" are not
+        after = dot_pos + 1
+        if after >= len(text) or text[after] not in ' \t':
+            return False
+        return self._at_line_start(text, j + 1)
+
+    def _is_line_item_start(self, text: str, pos: int) -> bool:
+        """True if pos opens a bullet or heading line, which reads as one unit."""
+        if not self._at_line_start(text, pos):
+            return False
+        ch = text[pos]
+        if ch == '#':
+            return True
+        if ch in self.BULLET_MARKERS:
+            nxt = pos + 1
+            return nxt < len(text) and text[nxt] in ' \t'
+        return False
 
     def get_positions(self, text: str) -> list[tuple[int, int]]:
         if not text or not text.strip():
@@ -83,7 +113,10 @@ class SentenceSplitter:
                     i += 1
                     continue
                 sentence_start = i
-                in_list_item = False
+                # Bullets and headings run to the end of their line: they carry
+                # no terminal punctuation, so without this they merge into the
+                # paragraph that follows.
+                in_list_item = self._is_line_item_start(text, i)
 
             # Inside a list item, a newline ends the sentence (each line = one item)
             if in_list_item and text[i] == '\n':
@@ -188,56 +221,80 @@ class SentenceSplitter:
         return [text[start:end] for start, end in positions]
 
 
-# Number-to-words for TTS normalization (0–999)
-_ONES = [
-    '', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine',
-    'ten', 'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen', 'sixteen',
-    'seventeen', 'eighteen', 'nineteen',
-]
-_TENS = ['', '', 'twenty', 'thirty', 'forty', 'fifty', 'sixty', 'seventy', 'eighty', 'ninety']
+# ── Text normalization ──────────────────────────────────────────────────────
+# Both gTTS and Piper (via espeak-ng) already speak numerals, currency, times
+# and percentages correctly, so we deliberately leave digits alone: rewriting
+# "1,000" or "3.14" into words destroys information the engine would have
+# voiced properly. What the engines *cannot* handle is markup -- they read
+# "**", "##" and URLs out literally -- so that is what we strip here.
 
-
-def _int_to_words(n: int) -> str:
-    if n == 0:
-        return 'zero'
-    if n < 0:
-        return 'minus ' + _int_to_words(-n)
-    if n < 20:
-        return _ONES[n]
-    if n < 100:
-        return _TENS[n // 10] + ('' if n % 10 == 0 else ' ' + _ONES[n % 10])
-    if n < 1000:
-        return _ONES[n // 100] + ' hundred' + ('' if n % 100 == 0 else ' ' + _int_to_words(n % 100))
-    return str(n)  # leave large numbers as digits — TTS handles them fine in context
+_MD_LINK_RE = re.compile(r'\[([^\]\n]+)\]\([^)\n]*\)')
+_BARE_URL_RE = re.compile(r'(?:https?://|www\.)\S+', re.IGNORECASE)
+_HEADING_RE = re.compile(r'^#{1,6}\s*')
+_BULLET_RE = re.compile(r'^[-*+\u2022\u25cf\u25aa]\s+')
+_LIST_NUM_RE = re.compile(r'^(\d{1,3})[.)]\s+')
+# Emphasis delimiters only count when they sit outside a word, so identifiers
+# like generate_sentence and file_name_here survive intact.
+_EMPHASIS_RE = re.compile(r'(?<![\w*_])(\*\*\*|___|\*\*|__|\*|_)(?=\S)(.+?)(?<=\S)\1(?![\w*_])')
+# A dash reads as a pause only when it separates two things: spaced out
+# ("details -- it's striking") or joining two words ("result--surprisingly").
+# "--length_scale" is a command-line flag and is left alone.
+_DASH_RE = re.compile(r'\s+(?:--+|[\u2014\u2013])\s+|(?<=\w)(?:--+|[\u2014\u2013])(?=\w)')
+# "3.5–4.2%" is a range, and reads as a range
+_NUM_RANGE_RE = re.compile(r'(?<=\d)\s*[\u2013\u2014]\s*(?=\d)')
+_CHECKBOX_RE = re.compile(r'^\[[ xX]?\]\s*')
+_STRAY_MARKUP_RE = re.compile(r'[`*#~|>]')
+# Curly quotes are folded to ASCII rather than dropped -- deleting the
+# apostrophe in "don’t" would leave the engine saying "dont".
+_SMART_QUOTES = {
+    '\u2018': "'", '\u2019': "'", '\u201c': '"', '\u201d': '"', '\u2032': "'",
+}
+_SPEAKABLE_RE = re.compile(r'[^\W_]', re.UNICODE)
 
 
 def normalize_for_tts(text: str) -> str:
-    """Normalize text for better TTS pronunciation.
+    """Prepare one sentence for the TTS engine.
 
-    - Collapses internal whitespace (newlines from line-wrapped text) to single spaces
-    - Converts standalone integers (0–999) to words
-    - Strips numbered-list prefixes (e.g. '3. ' → 'three, ')
+    Strips markup that engines would otherwise read aloud, collapses the
+    newlines that line-wrapped text leaves mid-sentence, and leaves all
+    numbers and words exactly as written. Returns "" when nothing speakable
+    is left (a horizontal rule, a stray bullet), so the caller can skip it.
     """
-    # Collapse whitespace first — line-wrapped text often has newlines mid-sentence
-    # which cause TTS engines to stutter or skip words
+    if not text:
+        return ""
+
+    # Links first, so [label](url) keeps its label before bare URLs are dropped
+    text = _MD_LINK_RE.sub(r'\1', text)
+    text = _BARE_URL_RE.sub('link', text)
+
+    # Leading line markers, on the sentence as the splitter handed it to us
+    text = text.strip()
+    text = _HEADING_RE.sub('', text)
+    text = _BULLET_RE.sub('', text)
+    text = _CHECKBOX_RE.sub('', text)
+    # "3. Walk the dog" -> "3, Walk the dog": a bare "3." reads as a full stop,
+    # which makes the engine pause as if the item had ended.
+    text = _LIST_NUM_RE.sub(r'\1, ', text)
+
+    for curly, plain in _SMART_QUOTES.items():
+        text = text.replace(curly, plain)
+    text = text.replace('`', '')
+    text = _EMPHASIS_RE.sub(r'\2', text)
+    text = _NUM_RANGE_RE.sub(' to ', text)
+    text = _DASH_RE.sub(', ', text)
+    text = re.sub(r'\s*&\s*', ' and ', text)
+
+    # Anything left is decoration the engine would pronounce
+    text = _STRAY_MARKUP_RE.sub('', text)
+
+    # Collapse the newlines line-wrapped text leaves mid-sentence
     text = ' '.join(text.split())
+    # Tidy spacing the substitutions above may have left behind
+    text = re.sub(r'\s+([,.;:!?])', r'\1', text)
+    text = re.sub(r'^[,.;:]\s*', '', text)
 
-    # Replace numbered list prefixes at line/sentence start: "3. " → "three, "
-    def _replace_list_prefix(m):
-        n = int(m.group(1))
-        if 0 <= n <= 999:
-            return _int_to_words(n) + ',' + m.group(2)
-        return m.group(0)
-    text = re.sub(r'^(\d{1,3})\.([ \t])', _replace_list_prefix, text, flags=re.MULTILINE)
-
-    # Replace standalone integers surrounded by word boundaries
-    def _replace_number(m):
-        n = int(m.group(0))
-        if 0 <= n <= 999:
-            return _int_to_words(n)
-        return m.group(0)
-    text = re.sub(r'\b\d{1,3}\b', _replace_number, text)
-
+    if not _SPEAKABLE_RE.search(text):
+        return ""
     return text
 
 
@@ -295,6 +352,30 @@ class SessionStore:
             del sessions[key]
             self._save_sessions(sessions)
 
+    def _last_text_path(self) -> str:
+        return os.path.join(self.base_dir, "last_text.txt")
+
+    def save_last_text(self, text: str) -> None:
+        """Remember the article, so reopening does not mean re-pasting it.
+
+        Blank text is ignored: closing an empty window should not wipe what was
+        saved from the previous session.
+        """
+        if not text or not text.strip():
+            return
+        try:
+            with open(self._last_text_path(), "w", encoding="utf-8") as f:
+                f.write(text)
+        except OSError:
+            pass
+
+    def load_last_text(self) -> str | None:
+        try:
+            with open(self._last_text_path(), "r", encoding="utf-8") as f:
+                return f.read()
+        except (OSError, UnicodeDecodeError):
+            return None
+
     def prune_old(self, max_age_days: int = 30, max_sessions: int = 50) -> None:
         """Remove sessions older than max_age_days and keep at most max_sessions."""
         sessions = self._load_sessions()
@@ -306,6 +387,102 @@ class SessionStore:
             sorted_keys = sorted(sessions, key=lambda k: sessions[k].get("timestamp", 0), reverse=True)
             sessions = {k: sessions[k] for k in sorted_keys[:max_sessions]}
         self._save_sessions(sessions)
+
+
+# ── Duration estimates ──────────────────────────────────────────────────────
+# Calibrated against measured Piper output: an eight-word sentence took ~3.4s at
+# 1.0x, and a fourteen-word one ~5.9s, both landing near 140 words per minute.
+WORDS_PER_MINUTE = 140
+
+
+def estimate_seconds(text: str, speed: float = 1.0) -> float:
+    """Roughly how long `text` takes to read aloud at `speed`."""
+    words = len(text.split())
+    if not words:
+        return 0
+    return words / WORDS_PER_MINUTE * 60.0 / max(speed, 0.1)
+
+
+def format_duration(seconds: float) -> str:
+    """A short, human duration: '45 sec', '10 min', '1 hr 15 min'."""
+    seconds = int(max(0, round(seconds)))
+    if seconds < 60:
+        return f"{seconds} sec"
+    minutes = math.ceil(seconds / 60)
+    if minutes < 60:
+        return f"{minutes} min"
+    hours, remainder = divmod(minutes, 60)
+    return f"{hours} hr {remainder} min" if remainder else f"{hours} hr"
+
+
+# ── Playback speed ──────────────────────────────────────────────────────────
+# gTTS offers only "normal" and "slow", so asking it for 1.5x returns exactly
+# the same audio as 1.0x. Real speed control means re-timing the clip after the
+# fact; ffmpeg's atempo filter does it without the chipmunk pitch shift that
+# naive resampling causes. Without ffmpeg we fall back to what gTTS can do and
+# say so in the UI rather than showing a slider that does nothing.
+
+_FFMPEG_CHECKED = None
+
+
+def ffmpeg_available() -> bool:
+    """Whether ffmpeg is on PATH. Probed once, then remembered."""
+    global _FFMPEG_CHECKED
+    if _FFMPEG_CHECKED is None:
+        _FFMPEG_CHECKED = shutil.which("ffmpeg") is not None
+    return _FFMPEG_CHECKED
+
+
+def atempo_chain(speed: float) -> str:
+    """Build an atempo filter chain for any ratio.
+
+    A single atempo only accepts 0.5-2.0, so ratios outside that are split into
+    several passes whose product is the requested speed.
+    """
+    factors = []
+    remaining = float(speed)
+    while remaining > 2.0:
+        factors.append(2.0)
+        remaining /= 2.0
+    while remaining < 0.5:
+        factors.append(0.5)
+        remaining /= 0.5
+    factors.append(remaining)
+    return ",".join("atempo={:.6g}".format(f) for f in factors)
+
+
+def time_stretch(path: str, speed: float) -> str:
+    """Re-time an audio file, preserving pitch.
+
+    Returns the path to play. The re-timed copy replaces the original, so the
+    source is removed on success. Returns `path` unchanged when there is nothing
+    to do or when ffmpeg cannot read the file -- a clip at the wrong speed still
+    beats no clip at all.
+    """
+    if abs(speed - 1.0) < 0.01 or not ffmpeg_available():
+        return path
+    root, ext = os.path.splitext(path)
+    out_path = root + ".speed" + (ext or ".mp3")
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-nostdin", "-loglevel", "error", "-y",
+             "-i", path, "-filter:a", atempo_chain(speed), out_path],
+            capture_output=True, timeout=60,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return path
+    if result.returncode != 0 or not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+        if os.path.exists(out_path):
+            try:
+                os.unlink(out_path)
+            except OSError:
+                pass
+        return path
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+    return out_path
 
 
 class TTSEngine(ABC):
@@ -336,6 +513,10 @@ class TTSEngine(ABC):
         """Get the display name of this engine"""
         pass
 
+    def supports_speed(self) -> bool:
+        """Whether this engine can actually honour the speed setting."""
+        return True
+
 
 class GoogleTTSEngine(TTSEngine):
     """Google TTS using gTTS"""
@@ -350,10 +531,13 @@ class GoogleTTSEngine(TTSEngine):
             raise Exception("gTTS not available")
         tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
         tmp_file.close()
-        slow = speed < 1.0
+        # gTTS has no real speed control, only a "slow" flag. When we can
+        # re-time the clip ourselves we ask for normal speed and stretch it;
+        # otherwise "slow" is the only slower-than-normal option we have.
+        slow = speed < 1.0 and not ffmpeg_available()
         tts = gTTS(text=text, lang=language, slow=slow)
         tts.save(tmp_file.name)
-        return tmp_file.name
+        return time_stretch(tmp_file.name, speed)
 
     def speak(self, text: str, speed: float, callback: Optional[Callable] = None, language: str = "en") -> None:
         if not GTTS_AVAILABLE or not PYGAME_AVAILABLE:
@@ -389,6 +573,10 @@ class GoogleTTSEngine(TTSEngine):
     def get_name(self) -> str:
         return "Google TTS"
 
+    def supports_speed(self) -> bool:
+        # Without ffmpeg the slider can only pick between normal and slow
+        return ffmpeg_available()
+
 
 class PiperTTSEngine(TTSEngine):
     """Piper TTS for offline high-quality speech"""
@@ -399,7 +587,10 @@ class PiperTTSEngine(TTSEngine):
         self.piper_dir = os.path.expanduser("~/.local/share/piper")
         self.voice_model = os.path.join(self.piper_dir, "en_US-norman-medium.onnx")
         self.voice_config = os.path.join(self.piper_dir, "en_US-norman-medium.onnx.json")
+        self._piper_installed = None
     
+    GENERATE_TIMEOUT = 60  # seconds before a wedged piper process is killed
+
     def generate(self, text: str, speed: float, **kwargs) -> str:
         """Generate audio file from text. Returns path to temp audio file."""
         if not self.is_available():
@@ -414,7 +605,16 @@ class PiperTTSEngine(TTSEngine):
             stderr=subprocess.PIPE,
             text=True
         )
-        stdout, stderr = process.communicate(input=text)
+        try:
+            stdout, stderr = process.communicate(input=text, timeout=self.GENERATE_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            # Without this a wedged piper holds the sentence forever, and the
+            # buffer's own waiters block behind it.
+            process.kill()
+            process.wait(timeout=5)
+            raise Exception(
+                f"Piper timed out after {self.GENERATE_TIMEOUT}s generating this sentence"
+            )
         if process.returncode != 0:
             raise Exception(f"Piper failed: {stderr}")
         return tmp_file.name
@@ -461,13 +661,24 @@ class PiperTTSEngine(TTSEngine):
         return "Piper TTS"
     
     def check_piper_installed(self) -> bool:
-        """Check if Piper is installed"""
-        try:
-            # Try to run piper with --help to see if it's installed
-            result = subprocess.run(["piper", "--help"], capture_output=True, text=True, timeout=2)
-            return result.returncode == 0
-        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-            return False
+        """Whether the piper command exists, probed once and remembered.
+
+        is_available() runs before every play press, and spawning
+        'piper --help' each time cost ~160ms of dead air.
+        """
+        if self._piper_installed is None:
+            try:
+                result = subprocess.run(
+                    ["piper", "--help"], capture_output=True, text=True, timeout=2
+                )
+                self._piper_installed = result.returncode == 0
+            except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+                self._piper_installed = False
+        return self._piper_installed
+
+    def invalidate_availability(self) -> None:
+        """Re-probe on the next check, after an install or a voice download."""
+        self._piper_installed = None
     
     def download_model(self, status_callback: Callable[[str], None]) -> bool:
         """Download the Piper voice model"""
@@ -492,15 +703,52 @@ class PiperTTSEngine(TTSEngine):
             return False
 
 
+class AudioPlayer:
+    """pygame.mixer.music behind a swappable interface, so playback logic can
+    be exercised without an audio device."""
+
+    def play(self, path: str) -> None:
+        pygame.mixer.music.load(path)
+        pygame.mixer.music.play()
+
+    def is_busy(self) -> bool:
+        # Tolerant of a mixer that was never started or is already torn down:
+        # cancel() runs on load, on close, and before the first play.
+        try:
+            return pygame.mixer.music.get_busy()
+        except pygame.error:
+            return False
+
+    def stop(self) -> None:
+        try:
+            pygame.mixer.music.stop()
+        except pygame.error:
+            pass
+
+
 class PlaybackController:
-    """Manages sentence-by-sentence playback with lookahead buffering."""
+    """Owns sentence-by-sentence playback: the audio buffer, the worker thread,
+    and the generation token that keeps exactly one thread in charge.
+
+    Every playback thread carries the generation token it was born with and
+    re-checks it before each step that touches shared state. Skipping bumps the
+    generation, which retires the running thread wherever it happens to be --
+    no flag to race on, and no thread to wait for.
+    """
 
     class State(Enum):
         STOPPED = "stopped"
         PLAYING = "playing"
         PAUSED = "paused"
 
-    def __init__(self, engine=None, session_store=None):
+    LOOKAHEAD = 3          # sentences pre-generated ahead of the one playing
+    KEEP_BEHIND = 2        # sentences of audio kept for a quick 'prev'
+    POLL_INTERVAL = 0.05   # seconds between "is the clip still playing?" checks
+    GENERATE_TIMEOUT = 60  # seconds a waiter blocks on someone else's generate
+    GENERATE_ATTEMPTS = 3  # tries before a sentence is reported as failed
+    RETRY_BACKOFF = 0.4    # seconds, multiplied by the attempt number
+
+    def __init__(self, engine=None, session_store=None, player=None):
         self.engine = engine
         self.session_store = session_store
         self.splitter = SentenceSplitter()
@@ -512,8 +760,28 @@ class PlaybackController:
         self.total_sentences = 0
         self.original_text = ""
 
-        self._buffer = {}
+        if player is None and PYGAME_AVAILABLE:
+            player = AudioPlayer()
+        self._player = player
+
+        self._buffer = {}        # buffer key -> generated audio file path
+        self._inflight = {}      # buffer key -> Event, set when generation ends
+        self._errors = {}        # buffer key -> exception from a failed generate
         self._buffer_lock = threading.Lock()
+        self._active_path = None
+
+        self._generation = 0
+        self._gen_lock = threading.RLock()
+        self._threads = []
+        self._thread_lock = threading.Lock()
+
+        # Hooks the UI fills in; each is called from the playback thread.
+        self.on_sentence_start = None
+        self.on_generating = None
+        self.on_finished = None
+        self.on_error = None
+        self.params_provider = lambda: (1.0, {})
+        self.engine_name_provider = lambda: ""
 
     @property
     def current_sentence(self) -> str:
@@ -528,6 +796,7 @@ class PlaybackController:
         return (0, 0)
 
     def load_text(self, text: str):
+        self.cancel()
         self.original_text = text
         self.sentences = self.splitter.split(text)
         self.positions = self.splitter.get_positions(text)
@@ -535,6 +804,38 @@ class PlaybackController:
         self.current_index = 0
         self.state = self.State.STOPPED
         self.cleanup_buffer()
+
+    # ── Generation tokens ───────────────────────────────────────────────
+
+    def begin_generation(self) -> int:
+        """Retire any running thread and mint the token for the next one."""
+        with self._gen_lock:
+            self._generation += 1
+            return self._generation
+
+    def is_current(self, gen: int) -> bool:
+        with self._gen_lock:
+            return gen == self._generation
+
+    def cancel(self) -> None:
+        """Stop playback now: invalidate the running thread and cut the audio.
+
+        Returns immediately -- the retired thread notices its stale token at its
+        next checkpoint and exits on its own, so the UI never blocks on a
+        network call that is already in flight.
+        """
+        with self._gen_lock:
+            self._generation += 1
+            if self._player is not None:
+                self._player.stop()
+            self._active_path = None
+
+    def live_thread_count(self) -> int:
+        with self._thread_lock:
+            self._threads = [t for t in self._threads if t.is_alive()]
+            return len(self._threads)
+
+    # ── Transport ───────────────────────────────────────────────────────
 
     def next_sentence(self):
         if self.current_index < self.total_sentences - 1:
@@ -547,17 +848,219 @@ class PlaybackController:
     def seek_to(self, index: int):
         self.current_index = max(0, min(index, self.total_sentences - 1))
 
-    def generate_sentence(self, index: int, speed: float, **kwargs) -> str:
-        with self._buffer_lock:
-            if index in self._buffer and os.path.exists(self._buffer[index]):
-                return self._buffer[index]
+    def sentence_at_offset(self, offset: int) -> Optional[int]:
+        """Which sentence covers a character offset, for click-to-jump.
+
+        An offset landing in the whitespace between two sentences belongs to the
+        one about to start, which is what a click in that gap means.
+        """
+        if not self.positions:
+            return None
+        offset = max(0, offset)
+        for index, (_, end) in enumerate(self.positions):
+            if offset < end:
+                return index
+        return len(self.positions) - 1
+
+    def remaining_text(self) -> str:
+        """Everything from the current sentence onward."""
+        return " ".join(self.sentences[self.current_index:])
+
+    def skip_next(self):
+        """Move one sentence forward, resuming playback if it was running."""
+        self._skip(self.next_sentence)
+
+    def skip_prev(self):
+        self._skip(self.prev_sentence)
+
+    def _skip(self, move):
+        was_playing = self.state == self.State.PLAYING
+        self.cancel()
+        move()
+        if was_playing:
+            self.start_playback_thread()
+
+    def start_playback_thread(self) -> None:
+        """Start the one thread that drives playback from current_index."""
+        gen = self.begin_generation()
+        thread = threading.Thread(target=self._playback_loop, args=(gen,), daemon=True)
+        with self._thread_lock:
+            self._threads = [t for t in self._threads if t.is_alive()]
+            self._threads.append(thread)
+        thread.start()
+
+    # ── Audio generation and buffering ──────────────────────────────────
+
+    def _buffer_key(self, index: int, speed: float, kwargs: dict) -> tuple:
+        """Speed and language are part of the key: audio cached at 1.0x must not
+        be replayed after the user drags the speed slider to 2.0x."""
+        return (index, round(float(speed), 3), tuple(sorted(kwargs.items())))
+
+    def generate_sentence(self, index: int, speed: float, **kwargs) -> Optional[str]:
+        """Return a playable audio file for a sentence, generating it once.
+
+        Concurrent callers for the same sentence (the player catching up to its
+        own lookahead) share a single generate instead of each paying for one.
+        Returns None when the sentence has nothing speakable in it.
+        """
         if index < 0 or index >= self.total_sentences:
             return None
-        sentence_text = normalize_for_tts(self.sentences[index])
-        audio_path = self.engine.generate(sentence_text, speed, **kwargs)
+        spoken = normalize_for_tts(self.sentences[index])
+        if not spoken:
+            return None
+
+        key = self._buffer_key(index, speed, kwargs)
         with self._buffer_lock:
-            self._buffer[index] = audio_path
+            path = self._buffer.get(key)
+            if path and os.path.exists(path):
+                return path
+            done = self._inflight.get(key)
+            owner = done is None
+            if owner:
+                done = threading.Event()
+                self._inflight[key] = done
+                self._errors.pop(key, None)
+
+        if not owner:
+            done.wait(timeout=self.GENERATE_TIMEOUT)
+            with self._buffer_lock:
+                error = self._errors.get(key)
+                if error is not None:
+                    raise error
+                return self._buffer.get(key)
+
+        try:
+            audio_path = self.engine.generate(spoken, speed, **kwargs)
+        except Exception as exc:
+            with self._buffer_lock:
+                self._errors[key] = exc
+                self._inflight.pop(key, None)
+            done.set()
+            raise
+        with self._buffer_lock:
+            self._buffer[key] = audio_path
+            self._inflight.pop(key, None)
+        done.set()
         return audio_path
+
+    def is_buffered(self, index: int, speed: float, **kwargs) -> bool:
+        """Whether this sentence's audio is already generated and on disk."""
+        key = self._buffer_key(index, speed, kwargs)
+        with self._buffer_lock:
+            path = self._buffer.get(key)
+        return bool(path and os.path.exists(path))
+
+    def _start_lookahead(self, index: int, speed: float, kwargs: dict, gen: int) -> None:
+        """Pre-generate the next few sentences while this one plays, so a skip
+        forward lands on audio that is already waiting."""
+        for offset in range(1, self.LOOKAHEAD + 1):
+            ahead = index + offset
+            if ahead >= self.total_sentences:
+                break
+            threading.Thread(
+                target=self._lookahead_worker,
+                args=(ahead, speed, dict(kwargs), gen),
+                daemon=True,
+            ).start()
+
+    def _lookahead_worker(self, index: int, speed: float, kwargs: dict, gen: int) -> None:
+        if not self.is_current(gen):
+            return
+        try:
+            self.generate_sentence(index, speed, **kwargs)
+        except Exception:
+            pass  # a failed pre-fetch is retried, and reported, on arrival
+
+    def prune_buffer(self, current_index: int) -> None:
+        """Drop cached audio outside the window around the current sentence."""
+        low = current_index - self.KEEP_BEHIND
+        high = current_index + self.LOOKAHEAD + 1
+        with self._buffer_lock:
+            for key in list(self._buffer):
+                if low <= key[0] <= high:
+                    continue
+                path = self._buffer.pop(key)
+                if path and path != self._active_path and os.path.exists(path):
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        pass
+
+    # ── The playback loop ───────────────────────────────────────────────
+
+    def _playback_loop(self, gen: int) -> None:
+        try:
+            while self.is_current(gen) and self.state == self.State.PLAYING:
+                index = self.current_index
+                if index < 0 or index >= self.total_sentences:
+                    break
+                speed, kwargs = self.params_provider()
+
+                # Only announce when there is an actual wait: the lookahead
+                # usually has the clip ready and the label would just flicker.
+                if self.on_generating and not self.is_buffered(index, speed, **kwargs):
+                    self.on_generating(index)
+
+                audio_path, failure = None, None
+                for attempt in range(1, self.GENERATE_ATTEMPTS + 1):
+                    if not self.is_current(gen):
+                        return
+                    try:
+                        audio_path = self.generate_sentence(index, speed, **kwargs)
+                        failure = None
+                        break
+                    except Exception as exc:
+                        # A dropped connection should cost a pause, not the
+                        # rest of the article.
+                        failure = exc
+                        if attempt < self.GENERATE_ATTEMPTS:
+                            time.sleep(self.RETRY_BACKOFF * attempt)
+                if failure is not None:
+                    self.state = self.State.STOPPED
+                    if self.is_current(gen) and self.on_error:
+                        self.on_error(failure)
+                    return
+
+                if not self.is_current(gen):
+                    return
+
+                self._start_lookahead(index, speed, kwargs, gen)
+                if self.on_sentence_start:
+                    self.on_sentence_start(index)
+
+                if audio_path and os.path.exists(audio_path) and self._player is not None:
+                    # Claiming the token and starting the clip under one lock
+                    # keeps a thread retired mid-step from ever reaching the
+                    # speaker after cancel() has silenced it.
+                    with self._gen_lock:
+                        if not self.is_current(gen):
+                            return
+                        self._player.play(audio_path)
+                        self._active_path = audio_path
+                    while self.is_current(gen) and self._player.is_busy():
+                        time.sleep(self.POLL_INTERVAL)
+
+                if not self.is_current(gen):
+                    return
+
+                self.save_current_position(speed, self.engine_name_provider())
+                self.prune_buffer(index)
+
+                if index >= self.total_sentences - 1:
+                    break
+                # Assigned, not incremented: a thread can only ever move the
+                # index to the sentence after the one it actually played.
+                self.current_index = index + 1
+
+            if self.is_current(gen):
+                self.state = self.State.STOPPED
+                if self.on_finished:
+                    self.on_finished()
+        except Exception as exc:
+            if self.is_current(gen) and self.on_error:
+                self.on_error(exc)
+
+    # ── Session persistence ─────────────────────────────────────────────
 
     def check_saved_position(self) -> dict | None:
         if self.session_store and self.original_text:
@@ -582,8 +1085,12 @@ class PlaybackController:
                     except OSError:
                         pass
             self._buffer.clear()
+            self._inflight.clear()
+            self._errors.clear()
+        self._active_path = None
 
     def cleanup(self):
+        self.cancel()
         self.cleanup_buffer()
 
 
@@ -605,7 +1112,11 @@ class UnifiedTTSApp:
     BANNER_BG = "#FFF176"
     BANNER_FG = "#333333"
 
-    def __init__(self, root):
+    def __init__(self, root, session_store=None):
+        """`session_store` is injectable so tests never touch the real one --
+        restoring the last article at startup otherwise reads a user's saved
+        text straight into the test fixture.
+        """
         self.root = root
         self.root.title("Text to Speech")
         self.root.configure(bg=self.BG)
@@ -632,13 +1143,18 @@ class UnifiedTTSApp:
         }
 
         self.current_engine = None
-        self.session_store = SessionStore()
+        self.session_store = session_store if session_store is not None else SessionStore()
         self.session_store.prune_old()
         self.playback = PlaybackController(session_store=self.session_store)
-        self._playback_thread = None
-        self._stop_event = threading.Event()
+        # Mirrors of the Tk variables, safe to read from the playback thread
+        self._current_speed = 1.5
+        self._current_language = "en"
+        self._restart_after_id = None
+        self._suppress_seek = False
 
         self.create_ui()
+        self._bind_shortcuts()
+        self._restore_last_text()
         self.check_engines_and_initialize()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -772,6 +1288,7 @@ class UnifiedTTSApp:
             state="readonly", width=25, font=("Helvetica", 11),
         )
         self.lang_combo.set("English (en)")
+        self.lang_combo.bind('<<ComboboxSelected>>', self.on_language_change)
         self.lang_combo.pack(side=tk.LEFT, padx=5)
 
         # Speed control
@@ -798,6 +1315,12 @@ class UnifiedTTSApp:
             fg=self.ACCENT_BLUE, bg=self.BG, width=5,
         )
         self.speed_label.pack(side=tk.LEFT, padx=5)
+
+        # Shown only when the selected engine cannot actually change speed
+        self.speed_hint = tk.Label(
+            speed_frame, text="", font=("Helvetica", 10),
+            fg=self.ACCENT_ORANGE, bg=self.BG,
+        )
 
         # ── Progress bar ──
         progress_frame = tk.Frame(controls_frame, bg=self.BG)
@@ -845,6 +1368,12 @@ class UnifiedTTSApp:
         )
         self.next_button.pack(side=tk.LEFT, padx=6)
 
+        tk.Label(
+            controls_frame,
+            text="space play/pause   \u2190 \u2192 skip   \u2191 \u2193 speed   esc stop   click a sentence to jump",
+            font=("Helvetica", 10), fg=self.FG_DIM, bg=self.BG,
+        ).pack(pady=(0, 2))
+
         # ── Resume banner (hidden by default) ──
         self.resume_frame = tk.Frame(main_frame, bg=self.BANNER_BG, padx=12, pady=6)
         self.resume_label = tk.Label(
@@ -852,18 +1381,12 @@ class UnifiedTTSApp:
             bg=self.BANNER_BG, fg=self.BANNER_FG,
         )
         self.resume_label.pack(side=tk.LEFT, padx=5)
-        self.resume_yes_btn = tk.Button(
-            self.resume_frame, text="Resume", command=self.on_resume_yes,
+        self.start_over_btn = tk.Button(
+            self.resume_frame, text="Start Over", command=self.on_start_over,
             font=("Helvetica", 10, "bold"), bg=self.ACCENT_GREEN, fg="white",
             relief=tk.FLAT, padx=10, pady=2, cursor="hand2",
         )
-        self.resume_yes_btn.pack(side=tk.LEFT, padx=5)
-        self.resume_no_btn = tk.Button(
-            self.resume_frame, text="Start Over", command=self.on_resume_no,
-            font=("Helvetica", 10), bg=self.BG_LIGHT, fg=self.FG,
-            relief=tk.FLAT, padx=10, pady=2, cursor="hand2",
-        )
-        self.resume_no_btn.pack(side=tk.LEFT, padx=5)
+        self.start_over_btn.pack(side=tk.LEFT, padx=5)
 
         # ── Status ──
         self.status_label = tk.Label(
@@ -1000,6 +1523,113 @@ class UnifiedTTSApp:
             self.status_label.config(text="No TTS engines available. Please install dependencies.", fg=self.ACCENT_RED)
             self._set_play_button_enabled(False)
     
+    SPEED_STEP = 0.1
+
+    def _bind_shortcuts(self):
+        """Transport keys that work anywhere except inside the text box.
+
+        Bound with bind_all and filtered on event.widget, so typing an article
+        still inserts spaces and moves the caret with the arrow keys.
+        """
+        self.root.bind_all("<space>", self._key_play_pause)
+        self.root.bind_all("<Right>", self._key_next)
+        self.root.bind_all("<Left>", self._key_prev)
+        self.root.bind_all("<Escape>", self._key_stop)
+        self.root.bind_all("<Up>", self._key_faster)
+        self.root.bind_all("<Down>", self._key_slower)
+        self.text_area.bind("<Button-1>", self._on_text_click)
+
+    def _typing(self, event):
+        return getattr(event, "widget", None) is self.text_area
+
+    def _key_play_pause(self, event):
+        if self._typing(event):
+            return None
+        self.on_play_pause()
+        return "break"
+
+    def _key_next(self, event):
+        if self._typing(event):
+            return None
+        self.on_next()
+        return "break"
+
+    def _key_prev(self, event):
+        if self._typing(event):
+            return None
+        self.on_prev()
+        return "break"
+
+    def _key_stop(self, event):
+        if self._typing(event):
+            return None
+        self.on_stop()
+        return "break"
+
+    def _key_faster(self, event):
+        return self._nudge_speed(self.SPEED_STEP, event)
+
+    def _key_slower(self, event):
+        return self._nudge_speed(-self.SPEED_STEP, event)
+
+    def _nudge_speed(self, delta, event):
+        if self._typing(event):
+            return None
+        speed = round(min(2.0, max(0.5, self._current_speed + delta)), 2)
+        self.speed_var.set(speed)
+        self.update_speed_label(speed)
+        return "break"
+
+    def _on_text_click(self, event):
+        """Click a sentence to jump to it, once there is something to jump in."""
+        index = self.text_area.index(f"@{event.x},{event.y}")
+        self._jump_to_text_index(index)
+        return None
+
+    def _jump_to_text_index(self, tk_index) -> bool:
+        """Seek to the sentence covering a Tk text index. False if not possible."""
+        if self.playback.total_sentences == 0:
+            return False
+        # Offsets only mean anything while the box still holds the loaded text
+        if self.text_area.get("1.0", "end-1c") != self.playback.original_text:
+            return False
+        offset = len(self.text_area.get("1.0", tk_index))
+        target = self.playback.sentence_at_offset(offset)
+        if target is None or target == self.playback.current_index:
+            return False
+        was_playing = self.playback.state == PlaybackController.State.PLAYING
+        self.playback.cancel()
+        self.playback.seek_to(target)
+        self._update_progress()
+        self._highlight_current()
+        if was_playing:
+            self._schedule_restart(delay_ms=120)
+        return True
+
+    def _restore_last_text(self):
+        """Put the last article back, so reopening does not mean re-pasting."""
+        remembered = self.session_store.load_last_text()
+        if remembered and not self.text_area.get("1.0", "end-1c").strip():
+            self.text_area.insert("1.0", remembered)
+
+    def _update_speed_availability(self):
+        """Match the speed control to what the engine can actually deliver."""
+        engine = self.current_engine
+        supported = engine.supports_speed() if engine else True
+        if supported:
+            self.speed_slider.config(state=tk.NORMAL)
+            self.speed_hint.pack_forget()
+        else:
+            self.speed_slider.config(state=tk.DISABLED)
+            self.speed_hint.config(text="install ffmpeg for speed control")
+            self.speed_hint.pack(side=tk.LEFT, padx=8)
+
+    def on_language_change(self, event=None):
+        """Cache the language code so the playback thread never reads a Tk var."""
+        selection = self.lang_combo.get()
+        if "(" in selection and ")" in selection:
+            self._current_language = selection.split("(")[1].split(")")[0]
+
     def on_engine_change(self, event=None):
         """Handle engine selection change"""
         selection = self.engine_combo.get()
@@ -1012,12 +1642,14 @@ class UnifiedTTSApp:
             self.lang_frame.pack(pady=10)
             self._set_play_button_enabled(True)
             self.status_label.config(text="Ready - Google TTS", fg=self.ACCENT_GREEN)
+            self._update_speed_availability()
 
         elif "Piper TTS (Offline)" in selection:
             self.current_engine = self.engines['piper']
             self.lang_frame.pack_forget()
             self._set_play_button_enabled(True)
             self.status_label.config(text="Ready - Piper TTS", fg=self.ACCENT_GREEN)
+            self._update_speed_availability()
 
         elif "Model Not Downloaded" in selection:
             self.current_engine = None
@@ -1056,6 +1688,7 @@ class UnifiedTTSApp:
     def refresh_engines_after_download(self):
         """Refresh engine list after downloading Piper model"""
         self.download_button.pack_forget()
+        self.engines['piper'].invalidate_availability()
         self.check_engines_and_initialize()
         
         # Select Piper TTS if now available
@@ -1067,8 +1700,9 @@ class UnifiedTTSApp:
                 break
     
     def update_speed_label(self, value):
-        """Update the speed label"""
+        """Update the speed label and the thread-safe speed mirror."""
         speed = float(value)
+        self._current_speed = speed
         self.speed_label.config(text=f"{speed:.1f}x")
     
     def on_play_pause(self):
@@ -1086,61 +1720,90 @@ class UnifiedTTSApp:
             self.playback.load_text(text)
             saved = self.playback.check_saved_position()
             if saved and saved["sentence_index"] > 0:
-                self._show_resume_banner(saved)
-                return
+                # Resume straight away and say so. Making play show a banner and
+                # fall silent read as a broken play button.
+                self.playback.seek_to(saved["sentence_index"])
+                if "speed" in saved:
+                    self.speed_var.set(saved["speed"])
+                    self._current_speed = float(saved["speed"])
+                    self.speed_label.config(text=f"{saved['speed']:.1f}x")
+                self._show_resume_banner()
+            else:
+                self.resume_frame.pack_forget()
             self._start_playback()
         elif self.playback.state == PlaybackController.State.PLAYING:
             self._pause_playback()
         elif self.playback.state == PlaybackController.State.PAUSED:
             self._start_playback()
 
-    def _show_resume_banner(self, saved):
-        idx = saved["sentence_index"]
+    def _show_resume_banner(self):
+        index = self.playback.current_index
         total = self.playback.total_sentences
-        self.resume_label.config(text=f"Resume from sentence {idx + 1}/{total}?")
+        self.resume_label.config(
+            text=f"Picked up where you left off \u2014 sentence {index + 1} of {total}."
+        )
         self.resume_frame.pack(fill='x', pady=(5, 0))
 
-    def on_resume_yes(self):
-        saved = self.playback.check_saved_position()
-        if saved:
-            self.playback.seek_to(saved["sentence_index"])
-            if "speed" in saved:
-                self.speed_var.set(saved["speed"])
-                self.speed_label.config(text=f"{saved['speed']:.1f}x")
+    def on_start_over(self):
+        """Rewind to the beginning and keep playing."""
         self.resume_frame.pack_forget()
-        self._start_playback()
-
-    def on_resume_no(self):
-        self.resume_frame.pack_forget()
+        self.playback.cancel()
         self.playback.seek_to(0)
         self._start_playback()
 
+    def _playback_params(self):
+        """Speed and language for the next sentence.
+
+        Read from plain attributes rather than the Tk variables: this is called
+        on the playback thread, and Tk variables are not safe to touch there.
+        """
+        kwargs = {}
+        if isinstance(self.current_engine, GoogleTTSEngine):
+            kwargs["language"] = self._current_language
+        return self._current_speed, kwargs
+
+    def _wire_playback_callbacks(self):
+        """Point the controller's hooks at the UI, marshalled onto the main
+        thread -- they fire from the playback thread."""
+        self.playback.params_provider = self._playback_params
+        self.playback.engine_name_provider = (
+            lambda: self.current_engine.get_name() if self.current_engine else ""
+        )
+        self.playback.on_sentence_start = lambda index: self.root.after(
+            0, self._on_sentence_start
+        )
+        self.playback.on_generating = lambda index: self.root.after(0, self._on_generating)
+        self.playback.on_finished = lambda: self.root.after(0, self._on_playback_finished)
+        self.playback.on_error = lambda exc: self.root.after(
+            0, lambda: self._on_playback_error(exc)
+        )
+
     def _start_playback(self):
+        self._cancel_pending_restart()
+        self._wire_playback_callbacks()
         self.playback.state = PlaybackController.State.PLAYING
-        self._stop_event.clear()
         self._update_play_button("⏸", self.ACCENT_ORANGE)
         self.status_label.config(text="Speaking...", fg=self.ACCENT_BLUE)
         self._update_progress()
-        self._playback_thread = threading.Thread(target=self._playback_loop, daemon=True)
-        self._playback_thread.start()
+        # Take focus off the text box so space and the arrows drive playback
+        self.root.focus_set()
+        self.playback.start_playback_thread()
 
     def _pause_playback(self):
+        self._cancel_pending_restart()
         self.playback.state = PlaybackController.State.PAUSED
-        self._stop_event.set()
-        if PYGAME_AVAILABLE:
-            pygame.mixer.music.stop()
+        self.playback.cancel()
         self._update_play_button("▶", self.ACCENT_GREEN)
         self.status_label.config(text="Paused", fg=self.ACCENT_ORANGE)
         self.playback.save_current_position(
-            speed=self.speed_var.get(),
+            speed=self._current_speed,
             engine_name=self.current_engine.get_name() if self.current_engine else "",
         )
 
     def on_stop(self):
+        self._cancel_pending_restart()
         self.playback.state = PlaybackController.State.STOPPED
-        self._stop_event.set()
-        if PYGAME_AVAILABLE:
-            pygame.mixer.music.stop()
+        self.playback.cancel()
         self.playback.cleanup_buffer()
         self.playback.current_index = 0
         self._update_play_button("▶", self.ACCENT_GREEN)
@@ -1149,115 +1812,69 @@ class UnifiedTTSApp:
             fg=self.ACCENT_GREEN,
         )
         self._clear_highlight()
+        self.resume_frame.pack_forget()
         self._update_progress()
 
     def on_prev(self):
-        was_playing = self.playback.state == PlaybackController.State.PLAYING
-        if was_playing:
-            self._stop_event.set()
-            if PYGAME_AVAILABLE:
-                pygame.mixer.music.stop()
-        self.playback.prev_sentence()
+        self.playback.skip_prev()
         self._update_progress()
         self._highlight_current()
-        if was_playing:
-            self._stop_event.clear()
-            self._playback_thread = threading.Thread(target=self._playback_loop, daemon=True)
-            self._playback_thread.start()
 
     def on_next(self):
-        was_playing = self.playback.state == PlaybackController.State.PLAYING
-        if was_playing:
-            self._stop_event.set()
-            if PYGAME_AVAILABLE:
-                pygame.mixer.music.stop()
-        self.playback.next_sentence()
+        self.playback.skip_next()
         self._update_progress()
         self._highlight_current()
-        if was_playing:
-            self._stop_event.clear()
-            self._playback_thread = threading.Thread(target=self._playback_loop, daemon=True)
-            self._playback_thread.start()
 
     def on_progress_seek(self, value):
-        if self.playback.total_sentences > 0:
-            idx = int(float(value))
-            if idx != self.playback.current_index:
-                was_playing = self.playback.state == PlaybackController.State.PLAYING
-                if was_playing:
-                    self._stop_event.set()
-                    if PYGAME_AVAILABLE:
-                        pygame.mixer.music.stop()
-                self.playback.seek_to(idx)
-                self._highlight_current()
-                self._update_progress_label()
-                if was_playing:
-                    self._stop_event.clear()
-                    self._playback_thread = threading.Thread(target=self._playback_loop, daemon=True)
-                    self._playback_thread.start()
+        """Fires for every step of a slider drag, so the seek is coalesced:
+        the highlight follows the thumb, but playback restarts once, at the end.
+        """
+        if self._suppress_seek or self.playback.total_sentences == 0:
+            return
+        index = int(float(value))
+        if index == self.playback.current_index:
+            return
+        self.playback.cancel()          # silence immediately while dragging
+        self.playback.seek_to(index)
+        self._highlight_current()
+        self._update_progress_label()
+        self._schedule_restart()
 
-    def _playback_loop(self):
-        try:
-            while (
-                self.playback.state == PlaybackController.State.PLAYING
-                and self.playback.current_index < self.playback.total_sentences
-                and not self._stop_event.is_set()
-            ):
-                idx = self.playback.current_index
-                speed = self.speed_var.get()
+    def _schedule_restart(self, delay_ms=200):
+        self._cancel_pending_restart()
+        self._restart_after_id = self.root.after(delay_ms, self._commit_restart)
 
-                kwargs = {}
-                if isinstance(self.current_engine, GoogleTTSEngine):
-                    lang_code = self.lang_combo.get().split("(")[1].split(")")[0]
-                    kwargs["language"] = lang_code
+    def _cancel_pending_restart(self):
+        if self._restart_after_id is not None:
+            self.root.after_cancel(self._restart_after_id)
+            self._restart_after_id = None
 
-                try:
-                    audio_path = self.playback.generate_sentence(idx, speed, **kwargs)
-                except Exception as e:
-                    self.root.after(0, lambda e=e: messagebox.showerror("Error", f"Generation failed: {e}"))
-                    break
+    def _commit_restart(self):
+        self._restart_after_id = None
+        if self.playback.state == PlaybackController.State.PLAYING:
+            self.playback.start_playback_thread()
 
-                if self._stop_event.is_set():
-                    break
+    def _on_generating(self):
+        self.status_label.config(text="Generating audio\u2026", fg=self.ACCENT_BLUE)
 
-                # Lookahead: pre-generate next sentence
-                if idx + 1 < self.playback.total_sentences:
-                    lookahead = threading.Thread(
-                        target=self.playback.generate_sentence,
-                        args=(idx + 1, speed),
-                        kwargs=kwargs,
-                        daemon=True,
-                    )
-                    lookahead.start()
+    def _on_sentence_start(self):
+        self.status_label.config(text="Speaking\u2026", fg=self.ACCENT_BLUE)
+        self._highlight_current()
+        self._update_progress()
 
-                self.root.after(0, self._highlight_current)
-                self.root.after(0, self._update_progress)
+    def _on_playback_error(self, exc):
+        """Report a failed sentence without a modal.
 
-                if audio_path and os.path.exists(audio_path) and PYGAME_AVAILABLE:
-                    pygame.mixer.music.load(audio_path)
-                    pygame.mixer.music.play()
-                    while pygame.mixer.music.get_busy() and not self._stop_event.is_set():
-                        pygame.time.Clock().tick(10)
-
-                if self._stop_event.is_set():
-                    break
-
-                self.playback.save_current_position(
-                    speed=speed,
-                    engine_name=self.current_engine.get_name() if self.current_engine else "",
-                )
-
-                if self.playback.current_index < self.playback.total_sentences - 1:
-                    self.playback.current_index += 1
-                else:
-                    break
-
-            if self.playback.state == PlaybackController.State.PLAYING:
-                self.playback.state = PlaybackController.State.STOPPED
-                self.root.after(0, self._on_playback_finished)
-        except Exception as e:
-            self.root.after(0, lambda e=e: messagebox.showerror("Error", f"Playback failed: {e}"))
-            self.root.after(0, self._on_playback_finished)
+        The controller already retried; playback stops on the sentence that
+        failed, so pressing play picks up from exactly there.
+        """
+        self.playback.state = PlaybackController.State.STOPPED
+        self._update_play_button("▶", self.ACCENT_GREEN)
+        position = self.playback.current_index + 1
+        self.status_label.config(
+            text=f"Stopped at sentence {position}: {exc} \u2014 press play to retry",
+            fg=self.ACCENT_RED,
+        )
 
     def _on_playback_finished(self):
         self._update_play_button("▶", self.ACCENT_GREEN)
@@ -1290,34 +1907,37 @@ class UnifiedTTSApp:
 
     def _update_progress(self):
         total = self.playback.total_sentences
-        if total > 0:
-            self.progress_scale.config(to=max(total - 1, 1))
-            self.progress_var.set(self.playback.current_index)
-        else:
-            self.progress_scale.config(to=1)
-            self.progress_var.set(0)
+        # Moving the scale fires on_progress_seek; suppress it so our own
+        # updates are not mistaken for the user dragging the thumb.
+        self._suppress_seek = True
+        try:
+            if total > 0:
+                self.progress_scale.config(to=max(total - 1, 1))
+                self.progress_var.set(self.playback.current_index)
+            else:
+                self.progress_scale.config(to=1)
+                self.progress_var.set(0)
+        finally:
+            self._suppress_seek = False
         self._update_progress_label()
 
     def _update_progress_label(self):
         total = self.playback.total_sentences
-        if total > 0:
-            pct = int(((self.playback.current_index + 1) / total) * 100)
-            self.progress_label.config(text=f"{pct}%")
-        else:
+        if total <= 0:
             self.progress_label.config(text="0%")
+            return
+        pct = int(((self.playback.current_index + 1) / total) * 100)
+        left = estimate_seconds(self.playback.remaining_text(), self._current_speed)
+        self.progress_label.config(text=f"{pct}%  \u00b7  ~{format_duration(left)} left")
 
     def _on_close(self):
         if self.playback.state != PlaybackController.State.STOPPED:
             self.playback.save_current_position(
-                speed=self.speed_var.get(),
+                speed=self._current_speed,
                 engine_name=self.current_engine.get_name() if self.current_engine else "",
             )
-        self._stop_event.set()
-        if PYGAME_AVAILABLE:
-            try:
-                pygame.mixer.music.stop()
-            except:
-                pass
+        self._cancel_pending_restart()
+        self.session_store.save_last_text(self.text_area.get("1.0", "end-1c"))
         self.playback.cleanup()
         if PYGAME_AVAILABLE:
             pygame.quit()

@@ -48,7 +48,7 @@ class TestSpeed:
 
     def test_other_models_render_at_1x_and_get_retimed(self):
         client = RecordingClient()
-        engine = NeuralTTSEngine(voice_catalog.BY_KEY["drama3"], client)
+        engine = NeuralTTSEngine(voice_catalog.BY_KEY["ming"], client)
         os.unlink(engine.generate("Hi.", 1.5))
         assert client.calls[0]["speed"] == 1.0
         assert self.stretched == [1.5]
@@ -233,41 +233,40 @@ class NamedEngine:
 
 class TestSwitchingNeverReplaysTheOldEngine:
     def _switch_mid_generation(self):
-        """Breeze is generating sentence 1 when the user picks Drama 3. The
-        two share the voice id "soothing", so their cache keys matched."""
+        """The old engine is generating sentence 1 when the user switches. If
+        the two engines share a voice id, their cache keys used to match."""
         gate = threading.Event()
-        breeze = NamedEngine("breeze", hold_index=1, gate=gate)
+        old = NamedEngine("old", hold_index=1, gate=gate)
         player = LogPlayer(0.4)
-        c = PlaybackController(engine=breeze, session_store=SessionStore(base_dir=tempfile.mkdtemp()),
+        c = PlaybackController(engine=old, session_store=SessionStore(base_dir=tempfile.mkdtemp()),
                                player=player)
         c.load_text(" ".join(f"Sentence number {i} here." for i in range(6)))
-        c.params_provider = lambda: (1.5, {"voice": "soothing"})
+        c.params_provider = lambda: (1.5, {"voice": "shared"})
         c.state = PlaybackController.State.PLAYING
         c.start_playback_thread()
         time.sleep(0.2)
         # what UnifiedTTSApp._engine_switched does
         c.cancel()
         c.cleanup_buffer()
-        # Drama 3 is slower to start than Breeze is to finish, as in the app:
-        # the stale Breeze clip lands first.
-        drama = NamedEngine("drama3", delays={0: 0.2, 1: 0.3})
-        c.engine = drama
+        # The new engine is slower to start than the old one is to finish:
+        # the stale clip lands first.
+        c.engine = NamedEngine("new", delays={0: 0.2, 1: 0.3})
         c.start_playback_thread()
-        gate.set()             # the in-flight Breeze clip completes now
+        gate.set()             # the old engine's clip completes now
         time.sleep(2.0)
         c.state = PlaybackController.State.STOPPED
         c.cancel()
-        return player, breeze
+        return player, old
 
     def test_a_clip_still_generating_in_the_old_engine_is_never_played(self):
         player, _ = self._switch_mid_generation()
         after_switch = player.log[1:]
         assert after_switch, "nothing played after the switch"
-        assert not [p for p in after_switch if p.startswith("breeze")], after_switch
+        assert not [p for p in after_switch if p.startswith("old")], after_switch
 
     def test_the_superseded_clip_is_deleted_not_leaked(self):
-        _, breeze = self._switch_mid_generation()
-        late = [p for p in breeze.paths if "-s1-" in os.path.basename(p)]
+        _, old = self._switch_mid_generation()
+        late = [p for p in old.paths if "-s1-" in os.path.basename(p)]
         assert late and not any(os.path.exists(p) for p in late)
 
 

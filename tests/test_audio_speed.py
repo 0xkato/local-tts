@@ -1,12 +1,10 @@
 """Tests for real playback-speed control.
 
-gTTS exposes only 'normal' and 'slow', so every setting from 1.0x up produced
-byte-identical audio while the label claimed otherwise. Actual speed comes from
-time-stretching the generated clip, which preserves pitch.
+Most of the neural voices have no speed control of their own, so speed comes
+from time-stretching the generated clip, which preserves pitch.
 """
 import math
 import os
-import subprocess
 import sys
 import tempfile
 import wave
@@ -97,79 +95,3 @@ class TestTimeStretch:
             f.write(b"not audio")
         assert time_stretch(bogus, 1.5) == bogus
         os.unlink(bogus)
-
-
-def probe_duration(path):
-    out = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-         "-of", "default=nw=1:nk=1", path],
-        capture_output=True, text=True,
-    )
-    return float(out.stdout.strip())
-
-
-class FakeGTTS:
-    """Stands in for gTTS: writes a fixed 2s clip, ignoring speed entirely --
-    which is exactly what the real gTTS does above 1.0x."""
-    source = None
-    calls = []
-
-    def __init__(self, text, lang="en", slow=False):
-        FakeGTTS.calls.append({"text": text, "lang": lang, "slow": slow})
-
-    def save(self, path):
-        with open(FakeGTTS.source, "rb") as src, open(path, "wb") as dst:
-            dst.write(src.read())
-
-
-class TestEngineSpeedSupport:
-    def test_piper_always_supports_speed(self):
-        from tts_unified import PiperTTSEngine
-        assert PiperTTSEngine().supports_speed() is True
-
-    def test_google_speed_support_tracks_ffmpeg(self):
-        from tts_unified import GoogleTTSEngine
-        assert GoogleTTSEngine().supports_speed() == ffmpeg_available()
-
-
-@pytest.mark.skipif(not ffmpeg_available(), reason="ffmpeg not installed")
-class TestGoogleEngineHonoursSpeed:
-    def setup_method(self):
-        import tts_unified
-        self.mod = tts_unified
-        self.real_gtts = tts_unified.gTTS
-        self.real_flag = tts_unified.GTTS_AVAILABLE
-        FakeGTTS.source = make_wav(2.0)
-        FakeGTTS.calls = []
-        tts_unified.gTTS = FakeGTTS
-        tts_unified.GTTS_AVAILABLE = True
-
-    def teardown_method(self):
-        self.mod.gTTS = self.real_gtts
-        self.mod.GTTS_AVAILABLE = self.real_flag
-        if FakeGTTS.source and os.path.exists(FakeGTTS.source):
-            os.unlink(FakeGTTS.source)
-
-    def test_faster_setting_produces_shorter_audio(self):
-        """The reported defect: 1.0x and 2.0x were byte-identical."""
-        engine = self.mod.GoogleTTSEngine()
-        normal = engine.generate("hello there", 1.0)
-        fast = engine.generate("hello there", 2.0)
-        assert probe_duration(fast) < probe_duration(normal) * 0.7
-        os.unlink(normal)
-        os.unlink(fast)
-
-    def test_slower_setting_produces_longer_audio(self):
-        engine = self.mod.GoogleTTSEngine()
-        normal = engine.generate("hello there", 1.0)
-        slow = engine.generate("hello there", 0.5)
-        assert probe_duration(slow) > probe_duration(normal) * 1.5
-        os.unlink(normal)
-        os.unlink(slow)
-
-    def test_does_not_also_ask_gtts_for_slow(self):
-        """Stacking gTTS 'slow' on top of a time-stretch would double-slow it."""
-        engine = self.mod.GoogleTTSEngine()
-        out = engine.generate("hello there", 0.5)
-        assert FakeGTTS.calls[-1]["slow"] is False
-        os.unlink(out)

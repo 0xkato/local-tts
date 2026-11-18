@@ -1,7 +1,6 @@
 """Tests for the text handed to the TTS engine.
 
-Both gTTS and Piper/espeak-ng already speak numerals, currency and symbols
-correctly. Our job is to strip *markup* (which engines read aloud literally)
+The voices already speak numerals, currency and symbols themselves. Our job is to strip *markup* (which engines read aloud literally)
 and otherwise leave *content* alone -- rewriting digits destroys information
 the engine could have voiced properly.
 """

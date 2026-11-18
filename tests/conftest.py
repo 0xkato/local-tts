@@ -2,10 +2,9 @@
 
 The app lists the neural voices and warms up the selected one at startup. In
 tests that would launch the real voice worker and load a model for every UI
-test, so the voices environment is pointed somewhere empty: the neural
-engines then report "not set up" and the app falls back to Piper/Google,
-exactly as on a machine without them. Tests that need the worker pass an
-interpreter explicitly.
+test, so the voices environment is pointed somewhere empty: every engine
+then reports "not set up", exactly as on a machine without the voices. Tests
+that need the worker pass an interpreter explicitly, or inject a fake one.
 """
 import os
 

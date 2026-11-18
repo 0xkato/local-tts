@@ -2,7 +2,7 @@
 """Voice worker: runs the neural TTS models in their own process.
 
 The app's Tk interpreter cannot host these models -- mlx-audio needs Python
-3.11+, and a 24 GB model has no business sharing a process with the UI -- so
+3.11+, and a multi-gigabyte model has no business sharing a process with the UI -- so
 they live here, in the voices environment, one model at a time.
 
 Protocol: one JSON object per line on stdin, one reply per line on the
@@ -18,7 +18,7 @@ duplicate of it.
 Replies: {"id": n, "ok": true, ...} or {"id": n, "ok": false, "error": "..."},
 each carrying "loaded": the engine now in memory (or null), so the client
 never has to guess after a failure. While a request runs, {"id": n,
-"heartbeat": true} goes out every few seconds: a 24 GB first download takes
+"heartbeat": true} goes out every few seconds: a first download takes
 as long as the connection needs, and only silence means the worker is stuck.
 """
 import gc
@@ -115,11 +115,6 @@ class MlxEngine:
             return collect(self.model.generate(text=text, voice=voice, speed=speed, lang_code="a"))
         if key == "ming":
             return collect(self.model.generate(text=text, voice=voice, lang_code="en"))
-        if key in ("breeze", "drama3"):
-            ref_wav, ref_txt = ensure_reference(voice, current=self)
-            with open(ref_txt, encoding="utf-8") as f:
-                ref_text = f.read().strip()
-            return collect(self.model.generate(text=text, ref_audio=ref_wav, ref_text=ref_text))
         raise RuntimeError(f"no recipe for engine {key!r}")
 
     def unload(self):
@@ -130,35 +125,6 @@ class MlxEngine:
             mx.clear_cache()
         except Exception:
             pass
-
-
-def ensure_reference(voice, current=None):
-    """The clip a cloning voice copies. The default one is designed once by
-    Breeze from a text description and kept in the data dir."""
-    ref_wav, ref_txt = catalog.reference_paths(voice)
-    if os.path.exists(ref_wav) and os.path.exists(ref_txt):
-        return ref_wav, ref_txt
-    if voice != "soothing":
-        raise RuntimeError(f"missing reference voice {ref_wav}")
-    print("designing the soothing reference voice with Breeze...", file=sys.stderr)
-    spec = catalog.BY_KEY[catalog.REFERENCE_DESIGNER]
-    if current is not None and current.spec.key == spec.key:
-        designer, borrowed = current, False
-    else:
-        designer, borrowed = MlxEngine(spec), True
-    try:
-        audio, rate = collect(designer.model.generate(
-            text=catalog.SOOTHING_REFERENCE_TEXT,
-            instruct=catalog.SOOTHING_REFERENCE_DESIGN, cfg_scale=4, seed=7,
-        ))
-    finally:
-        if borrowed:
-            designer.unload()
-    os.makedirs(catalog.REFERENCE_DIR, exist_ok=True)
-    write_wav(ref_wav, audio, rate)
-    with open(ref_txt, "w", encoding="utf-8") as f:
-        f.write(catalog.SOOTHING_REFERENCE_TEXT)
-    return ref_wav, ref_txt
 
 
 class FakeEngine:
@@ -215,10 +181,6 @@ class Worker:
         self.unload()
         start = time.monotonic()
         spec = catalog.BY_KEY.get(key)
-        if spec is not None and spec.clones_reference and key != catalog.REFERENCE_DESIGNER:
-            # Making the reference may load Breeze (7.6 GB); do it while
-            # nothing else is in memory, not alongside a 24 GB model.
-            ensure_reference(spec.default_voice)
         engine = make_engine(key)
         # The first generation compiles kernels and builds pipelines -- a
         # second or more of dead air. Pay it here, while the app says

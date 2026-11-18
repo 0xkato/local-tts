@@ -14,11 +14,6 @@ import sys
 from dataclasses import dataclass, field
 
 DATA_DIR = os.path.expanduser("~/.local/share/local-tts")
-# Reference clips for the voices that clone one: <name>.wav plus <name>.txt
-# holding its exact transcript. They stay out of the repo on purpose -- the
-# default one is generated locally by Breeze, whose outputs carry its
-# non-commercial licence.
-REFERENCE_DIR = os.path.join(DATA_DIR, "voices")
 WORKER_LOG = os.path.join(DATA_DIR, "voices-worker.log")
 DEFAULT_VOICES_PYTHON = os.path.join(DATA_DIR, "voices-env", "bin", "python")
 
@@ -26,16 +21,6 @@ DEFAULT_VOICES_PYTHON = os.path.join(DATA_DIR, "voices-env", "bin", "python")
 # evenly whatever silence a model happens to leave. Seconds at 1x speed.
 TAIL_PAUSE = 0.25
 LEAD_PAD = 0.03
-
-SOOTHING_REFERENCE_TEXT = (
-    "Take a slow breath. There's no rush here, and we'll go through it "
-    "together, one page at a time."
-)
-SOOTHING_REFERENCE_DESIGN = (
-    "A warm, calm, soothing narrator in her thirties with a soft, low-pitched "
-    "American voice, speaking at a gentle, unhurried pace, like a late-night "
-    "audiobook reader."
-)
 
 
 @dataclass(frozen=True)
@@ -51,7 +36,6 @@ class EngineSpec:
     native_speed: bool = False  # False: the app re-times the clip with ffmpeg
     apple_only: bool = False    # mlx-audio needs Apple Silicon
     needs_espeak: bool = False  # Kokoro's out-of-dictionary fallback
-    clones_reference: bool = False  # speaks in the voice of a reference clip
     download_size: str = ""
 
     @property
@@ -62,11 +46,6 @@ class EngineSpec:
         return dict(self.voices).get(voice_id, voice_id)
 
 
-SOOTHING = (("soothing", "Soothing narrator"),)
-
-# Listed in dropdown order. The first one that can run on this machine is the
-# default: Kokoro with Heart, or Phonon where Kokoro cannot run (it needs an
-# Apple Silicon Mac and espeak-ng).
 ENGINES = (
     EngineSpec(
         key="kokoro", name="Kokoro", weight="light",
@@ -116,26 +95,9 @@ ENGINES = (
         ),
         default_voice="US_James", apple_only=True, download_size="3 GB",
     ),
-    EngineSpec(
-        key="breeze", name="Breeze TTS 2", weight="heavy",
-        detail="8 GB · Mac, 16 GB+ RAM · non-commercial", backend="mlx",
-        repo="mlx-community/Breeze-TTS-2-mlx",
-        voices=SOOTHING, default_voice="soothing", apple_only=True,
-        clones_reference=True, download_size="7.6 GB",
-    ),
-    EngineSpec(
-        key="drama3", name="Fish Drama 3", weight="very heavy",
-        detail="24 GB · Mac, 32 GB+ RAM", backend="mlx",
-        repo="mlx-community/fish-audio-drama-3-4bit",
-        voices=SOOTHING, default_voice="soothing", apple_only=True,
-        clones_reference=True, download_size="24 GB",
-    ),
 )
 
 BY_KEY = {spec.key: spec for spec in ENGINES}
-
-# Breeze designs the default reference voice when it is missing.
-REFERENCE_DESIGNER = "breeze"
 
 
 def voices_python() -> str:
@@ -185,11 +147,6 @@ def espeak_paths() -> tuple[str, str] | None:
             if os.path.exists(path) and os.path.isdir(data):
                 return path, data
     return None
-
-
-def reference_paths(voice: str) -> tuple[str, str]:
-    return (os.path.join(REFERENCE_DIR, voice + ".wav"),
-            os.path.join(REFERENCE_DIR, voice + ".txt"))
 
 
 def unavailable_reason(spec: EngineSpec) -> str:

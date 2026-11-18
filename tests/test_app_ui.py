@@ -94,6 +94,9 @@ class AppHarness:
         self.app.text_area.delete("1.0", "end")
         self.app.current_engine = engine or StubEngine()
         self.app.playback.engine = self.app.current_engine
+        # Tests have no voices set up, so the app disabled play at startup;
+        # the stub stands in for a usable engine, as if one had been picked.
+        self.app._set_play_button_enabled(True)
         self.app.playback.RETRY_BACKOFF = 0.01
         self.player = SilentPlayer()
         self.app.playback._player = self.player
@@ -233,8 +236,8 @@ class TestErrorsStayOutOfTheWay:
 
 
 class TestSpeedControlIsHonest:
-    """The slider defaulted to 1.5x while Google TTS ignored everything above
-    1.0x. If the engine cannot honour it, say so instead of pretending."""
+    """Without ffmpeg most voices cannot change speed. If the engine cannot
+    honour the slider, say so instead of pretending."""
 
     def _app(self, supports):
         h = AppHarness(TEXT, store_dir=tempfile.mkdtemp())
@@ -563,10 +566,10 @@ class TestNeuralVoicesInTheDropdown:
         assert in_hugh[0].startswith("Sentence number 1 "), "the change waited for the buffer"
 
     def test_picking_a_voice_that_cannot_run_frees_the_loaded_one(self, monkeypatch):
-        """Drama 3 loaded, then "Kokoro · unavailable" picked: nothing will
-        play, so the 24 GB should not stay in memory either."""
+        """Ming loaded, then "Kokoro · unavailable" picked: nothing will
+        play, so Ming should not stay in memory either."""
         h = NeuralHarness(TEXT, monkeypatch)
-        h.select("drama3")
+        h.select("ming")
         before = h.client.closed
         monkeypatch.setattr(voice_catalog, "unavailable_reason",
                             lambda spec: "needs espeak-ng" if spec.key == "kokoro" else "")
@@ -576,15 +579,6 @@ class TestNeuralVoicesInTheDropdown:
         assert closed > before, "the previous model was left loaded"
         assert active is None
 
-    def test_leaving_the_neural_voices_shuts_the_worker_down(self, monkeypatch):
-        """A heavy model should not sit in memory once you pick Piper or Google."""
-        h = NeuralHarness(TEXT, monkeypatch)
-        before = h.client.closed
-        target = "piper" if h.app.engines["piper"].is_available() else "google"
-        h.select(target)
-        closed = h.client.closed
-        h.close()
-        assert closed > before
 
 
 class TestPlaybackThreadNeverWaitsOnTheUI:

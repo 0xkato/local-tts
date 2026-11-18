@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Unified Text-to-Speech Application
-Supports Google TTS and Piper TTS engines
+Local text-to-speech: paste an article, listen to it sentence by sentence,
+read by local neural voices (Kokoro, Phonon, Ming) running in a worker process.
 """
 
 import re
@@ -23,13 +23,6 @@ from typing import Optional, Callable
 from abc import ABC, abstractmethod
 
 import voice_catalog
-
-# Required imports
-try:
-    from gtts import gTTS
-    GTTS_AVAILABLE = True
-except ImportError:
-    GTTS_AVAILABLE = False
 
 try:
     import pygame
@@ -225,8 +218,8 @@ class SentenceSplitter:
 
 
 # ── Text normalization ──────────────────────────────────────────────────────
-# Both gTTS and Piper (via espeak-ng) already speak numerals, currency, times
-# and percentages correctly, so we deliberately leave digits alone: rewriting
+# The voices already speak numerals, currency, times and percentages
+# themselves, so we deliberately leave digits alone: rewriting
 # "1,000" or "3.14" into words destroys information the engine would have
 # voiced properly. What the engines *cannot* handle is markup -- they read
 # "**", "##" and URLs out literally -- so that is what we strip here.
@@ -393,8 +386,8 @@ class SessionStore:
 
 
 # ── Duration estimates ──────────────────────────────────────────────────────
-# Calibrated against measured Piper output: an eight-word sentence took ~3.4s at
-# 1.0x, and a fourteen-word one ~5.9s, both landing near 140 words per minute.
+# Calibrated against measured speech: an eight-word sentence took ~3.4s at 1.0x,
+# and a fourteen-word one ~5.9s, both landing near 140 words per minute.
 WORDS_PER_MINUTE = 140
 
 
@@ -419,11 +412,10 @@ def format_duration(seconds: float) -> str:
 
 
 # ── Playback speed ──────────────────────────────────────────────────────────
-# gTTS offers only "normal" and "slow", so asking it for 1.5x returns exactly
-# the same audio as 1.0x. Real speed control means re-timing the clip after the
-# fact; ffmpeg's atempo filter does it without the chipmunk pitch shift that
-# naive resampling causes. Without ffmpeg we fall back to what gTTS can do and
-# say so in the UI rather than showing a slider that does nothing.
+# Most of the neural voices have no speed control of their own, so speed means
+# re-timing the clip after the fact; ffmpeg's atempo filter does it without the
+# chipmunk pitch shift that naive resampling causes. Without ffmpeg the UI says
+# so rather than showing a slider that does nothing.
 
 _FFMPEG_CHECKED = None
 
@@ -521,194 +513,9 @@ class TTSEngine(ABC):
         return True
 
 
-class GoogleTTSEngine(TTSEngine):
-    """Google TTS using gTTS"""
-
-    def __init__(self):
-        self.is_playing = False
-        self.current_audio_file = None
-
-    def generate(self, text: str, speed: float, language: str = "en") -> str:
-        """Generate audio file from text. Returns path to temp audio file."""
-        if not GTTS_AVAILABLE:
-            raise Exception("gTTS not available")
-        tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
-        tmp_file.close()
-        # gTTS has no real speed control, only a "slow" flag. When we can
-        # re-time the clip ourselves we ask for normal speed and stretch it;
-        # otherwise "slow" is the only slower-than-normal option we have.
-        slow = speed < 1.0 and not ffmpeg_available()
-        tts = gTTS(text=text, lang=language, slow=slow)
-        tts.save(tmp_file.name)
-        return time_stretch(tmp_file.name, speed)
-
-    def speak(self, text: str, speed: float, callback: Optional[Callable] = None, language: str = "en") -> None:
-        if not GTTS_AVAILABLE or not PYGAME_AVAILABLE:
-            raise Exception("gTTS or pygame not available")
-
-        self.is_playing = True
-        try:
-            self.current_audio_file = self.generate(text, speed, language=language)
-
-            pygame.mixer.music.load(self.current_audio_file)
-            pygame.mixer.music.play()
-
-            while pygame.mixer.music.get_busy() and self.is_playing:
-                pygame.time.Clock().tick(10)
-        finally:
-            self.is_playing = False
-            if self.current_audio_file and os.path.exists(self.current_audio_file):
-                try:
-                    os.unlink(self.current_audio_file)
-                except:
-                    pass
-            if callback:
-                callback()
-    
-    def stop(self) -> None:
-        self.is_playing = False
-        if PYGAME_AVAILABLE:
-            pygame.mixer.music.stop()
-    
-    def is_available(self) -> bool:
-        return GTTS_AVAILABLE and PYGAME_AVAILABLE
-    
-    def get_name(self) -> str:
-        return "Google TTS"
-
-    def supports_speed(self) -> bool:
-        # Without ffmpeg the slider can only pick between normal and slow
-        return ffmpeg_available()
-
-
-class PiperTTSEngine(TTSEngine):
-    """Piper TTS for offline high-quality speech"""
-    
-    def __init__(self):
-        self.is_playing = False
-        self.current_audio_file = None
-        self.piper_dir = os.path.expanduser("~/.local/share/piper")
-        self.voice_model = os.path.join(self.piper_dir, "en_US-norman-medium.onnx")
-        self.voice_config = os.path.join(self.piper_dir, "en_US-norman-medium.onnx.json")
-        self._piper_installed = None
-    
-    GENERATE_TIMEOUT = 60  # seconds before a wedged piper process is killed
-
-    def generate(self, text: str, speed: float, **kwargs) -> str:
-        """Generate audio file from text. Returns path to temp audio file."""
-        if not self.is_available():
-            raise Exception("Piper TTS not available")
-        tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-        tmp_file.close()
-        length_scale = 1.0 / speed
-        process = subprocess.Popen(
-            ["piper", "--model", self.voice_model, "--output_file", tmp_file.name, "--length_scale", str(length_scale)],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
-        try:
-            stdout, stderr = process.communicate(input=text, timeout=self.GENERATE_TIMEOUT)
-        except subprocess.TimeoutExpired:
-            # Without this a wedged piper holds the sentence forever, and the
-            # buffer's own waiters block behind it.
-            process.kill()
-            process.wait(timeout=5)
-            raise Exception(
-                f"Piper timed out after {self.GENERATE_TIMEOUT}s generating this sentence"
-            )
-        if process.returncode != 0:
-            raise Exception(f"Piper failed: {stderr}")
-        return tmp_file.name
-
-    def speak(self, text: str, speed: float, callback: Optional[Callable] = None) -> None:
-        if not self.is_available():
-            raise Exception("Piper TTS not available")
-
-        self.is_playing = True
-        try:
-            self.current_audio_file = self.generate(text, speed)
-
-            pygame.mixer.music.load(self.current_audio_file)
-            pygame.mixer.music.play()
-
-            while pygame.mixer.music.get_busy() and self.is_playing:
-                pygame.time.Clock().tick(10)
-        finally:
-            self.is_playing = False
-            if self.current_audio_file and os.path.exists(self.current_audio_file):
-                try:
-                    os.unlink(self.current_audio_file)
-                except:
-                    pass
-            if callback:
-                callback()
-    
-    def stop(self) -> None:
-        self.is_playing = False
-        if PYGAME_AVAILABLE:
-            pygame.mixer.music.stop()
-    
-    def is_available(self) -> bool:
-        if not PYGAME_AVAILABLE:
-            return False
-        
-        # Check if piper command is available
-        if not self.check_piper_installed():
-            return False
-        
-        return os.path.exists(self.voice_model)
-    
-    def get_name(self) -> str:
-        return "Piper TTS"
-    
-    def check_piper_installed(self) -> bool:
-        """Whether the piper command exists, probed once and remembered.
-
-        is_available() runs before every play press, and spawning
-        'piper --help' each time cost ~160ms of dead air.
-        """
-        if self._piper_installed is None:
-            try:
-                result = subprocess.run(
-                    ["piper", "--help"], capture_output=True, text=True, timeout=2
-                )
-                self._piper_installed = result.returncode == 0
-            except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-                self._piper_installed = False
-        return self._piper_installed
-
-    def invalidate_availability(self) -> None:
-        """Re-probe on the next check, after an install or a voice download."""
-        self._piper_installed = None
-    
-    def download_model(self, status_callback: Callable[[str], None]) -> bool:
-        """Download the Piper voice model"""
-        try:
-            import urllib.request
-            
-            os.makedirs(self.piper_dir, exist_ok=True)
-            
-            model_url = "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/norman/medium/en_US-norman-medium.onnx"
-            config_url = "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/norman/medium/en_US-norman-medium.onnx.json"
-            
-            status_callback("Downloading model file (12MB)...")
-            urllib.request.urlretrieve(model_url, self.voice_model)
-            
-            status_callback("Downloading config file...")
-            urllib.request.urlretrieve(config_url, self.voice_config)
-            
-            status_callback("Voice model downloaded successfully!")
-            return True
-        except Exception as e:
-            status_callback(f"Download failed: {str(e)}")
-            return False
-
-
 # ── Neural voices ───────────────────────────────────────────────────────────
 # The neural models run in a worker process with its own environment (see
-# voice_worker.py): mlx-audio needs Python 3.11+, and a model of up to 24 GB
+# voice_worker.py): mlx-audio needs Python 3.11+, and a model of several GB
 # should neither share the UI's process nor stay in memory once the user has
 # switched to another engine.
 
@@ -726,7 +533,7 @@ class VoiceWorkerClient:
     """
 
     # Seconds of *silence* before the worker counts as stuck. It sends a
-    # heartbeat every few seconds while working, so a 24 GB first download
+    # heartbeat every few seconds while working, so a multi-gigabyte first download
     # may take as long as the connection needs.
     START_TIMEOUT = 60
     LOAD_TIMEOUT = 120
@@ -896,7 +703,7 @@ class VoiceWorkerClient:
 
 
 class NeuralTTSEngine(TTSEngine):
-    """One model in the voice worker, e.g. Phonon or Drama 3."""
+    """One model in the voice worker, e.g. Kokoro or Phonon."""
 
     def __init__(self, spec: "voice_catalog.EngineSpec", client: VoiceWorkerClient):
         self.spec = spec
@@ -915,7 +722,7 @@ class NeuralTTSEngine(TTSEngine):
             except OSError:
                 pass
             raise
-        # Models without a speed control are re-timed like Google's clips are
+        # Models without a speed control are re-timed with ffmpeg
         return path if native else time_stretch(path, speed)
 
     def speak(self, text: str, speed: float, callback: Optional[Callable] = None) -> None:
@@ -1148,8 +955,8 @@ class PlaybackController:
 
     def _buffer_key(self, index: int, speed: float, kwargs: dict, engine=None) -> tuple:
         """Speed, language/voice and the engine are all part of the key: audio
-        cached at 1.0x must not be replayed at 2.0x, nor Breeze's "soothing"
-        voice played as Drama 3's."""
+        cached at 1.0x must not be replayed at 2.0x, nor one engine's clip
+        played as another's when their voice ids happen to match."""
         engine = self.engine if engine is None else engine
         return (index, round(float(speed), 3), tuple(sorted(kwargs.items())), id(engine))
 
@@ -1422,12 +1229,8 @@ class UnifiedTTSApp:
 
         # Initialize engines: the neural voices share one worker process
         self.voice_client = VoiceWorkerClient()
-        self.engines = {
-            'google': GoogleTTSEngine(),
-            'piper': PiperTTSEngine()
-        }
-        for spec in voice_catalog.ENGINES:
-            self.engines[spec.key] = NeuralTTSEngine(spec, self.voice_client)
+        self.engines = {spec.key: NeuralTTSEngine(spec, self.voice_client)
+                        for spec in voice_catalog.ENGINES}
         self._engine_keys = []       # dropdown index -> engine key
         self._voice_ids = []         # voice dropdown index -> voice id
         self._voice_for_engine = {}  # engine key -> voice last picked for it
@@ -1445,7 +1248,6 @@ class UnifiedTTSApp:
         self.playback = PlaybackController(session_store=self.session_store)
         # Mirrors of the Tk variables, safe to read from the playback thread
         self._current_speed = 1.5
-        self._current_language = "en"
         self._restart_after_id = None
         self._suppress_seek = False
 
@@ -1504,7 +1306,7 @@ class UnifiedTTSApp:
             font=("Helvetica", 30, "bold"), fg=self.FG, bg=self.BG,
         ).pack()
         tk.Label(
-            title_frame, text="Neural voices, Piper and Google TTS",
+            title_frame, text="Local neural voices",
             font=("Helvetica", 12), fg=self.FG_DIM, bg=self.BG,
         ).pack()
 
@@ -1532,15 +1334,6 @@ class UnifiedTTSApp:
         )
         self.engine_status.pack(side=tk.LEFT, padx=15)
 
-        self.download_button = tk.Button(
-            engine_frame, text="Download Voice Model",
-            command=self.download_piper_model,
-            font=("Helvetica", 10, "bold"),
-            bg=self.ACCENT_BLUE, fg="white",
-            activebackground="#1976D2", activeforeground="white",
-            relief=tk.FLAT, padx=12, pady=4, cursor="hand2",
-        )
-
         # ── Text area card ──
         tk.Label(
             main_frame, text="Enter text to speak:",
@@ -1566,31 +1359,8 @@ class UnifiedTTSApp:
         controls_frame = tk.Frame(main_frame, bg=self.BG)
         controls_frame.pack(pady=(12, 0), fill='x', expand=False)
 
-        # Language (Google) and voice (neural engines) sit on the engine row:
-        # a row of their own pushed the controls past the window's height.
-        self.lang_frame = tk.Frame(self.engine_frame, bg=self.BG)
-
-        tk.Label(
-            self.lang_frame, text="Language:", font=("Helvetica", 12),
-            fg=self.FG, bg=self.BG,
-        ).pack(side=tk.LEFT, padx=(0, 8))
-
-        self.lang_var = tk.StringVar(value="en")
-        languages = [
-            ("English", "en"), ("Spanish", "es"), ("French", "fr"),
-            ("German", "de"), ("Italian", "it"), ("Portuguese", "pt"),
-            ("Russian", "ru"), ("Japanese", "ja"), ("Korean", "ko"),
-            ("Chinese", "zh"),
-        ]
-        self.lang_combo = ttk.Combobox(
-            self.lang_frame, textvariable=self.lang_var,
-            values=[f"{name} ({code})" for name, code in languages],
-            state="readonly", width=25, font=("Helvetica", 11),
-        )
-        self.lang_combo.set("English (en)")
-        self.lang_combo.bind('<<ComboboxSelected>>', self.on_language_change)
-        self.lang_combo.pack(side=tk.LEFT, padx=5)
-
+        # The voice picker sits on the engine row: a row of its own pushed
+        # the controls past the window's height.
         self.voice_frame = tk.Frame(self.engine_frame, bg=self.BG)
         tk.Label(
             self.voice_frame, text="Voice:", font=("Helvetica", 12),
@@ -1784,27 +1554,17 @@ class UnifiedTTSApp:
             c._enabled = False
 
     # Dropdown order, as listed in voice_catalog; the first usable one is the default
-    ENGINE_ORDER = tuple(spec.key for spec in voice_catalog.ENGINES) + ('piper', 'google')
+    ENGINE_ORDER = tuple(spec.key for spec in voice_catalog.ENGINES)
 
     def _engine_entry(self, key):
         """(dropdown label, usable) for one engine."""
         engine = self.engines[key]
-        if isinstance(engine, NeuralTTSEngine):
-            spec = engine.spec
-            if engine.unavailable_reason():
-                return f"{spec.label} · unavailable", False
-            if not engine.is_downloaded():
-                return f"{spec.label} · {spec.download_size} download", True
-            return spec.label, True
-        if key == 'piper':
-            if engine.is_available():
-                return "Piper TTS (Offline)", True
-            if engine.check_piper_installed():
-                return "Piper TTS (Model Not Downloaded)", False
-            return "Piper TTS (Not Installed - pip install piper-tts)", False
-        if engine.is_available():
-            return "Google TTS (Online)", True
-        return "Google TTS (Not Available - Install gtts & pygame)", False
+        spec = engine.spec
+        if engine.unavailable_reason():
+            return f"{spec.label} \u00b7 unavailable", False
+        if not engine.is_downloaded():
+            return f"{spec.label} \u00b7 {spec.download_size} download", True
+        return spec.label, True
 
     UI_POLL_MS = 40
 
@@ -1839,13 +1599,10 @@ class UnifiedTTSApp:
         self.engine_combo['values'] = [label for _, label, _ in entries]
         usable = [key for key, _, ok in entries if ok]
 
-        if usable:
-            self.engine_combo.current(self._engine_keys.index(usable[0]))
-            self.on_engine_change()
-        else:
-            self.engine_combo.current(0)
-            self.status_label.config(text="No TTS engines available. Please install dependencies.", fg=self.ACCENT_RED)
-            self._set_play_button_enabled(False)
+        # With nothing usable, the first entry still says *why* (not set up,
+        # needs espeak-ng, ...), which beats a generic "no engines".
+        self.engine_combo.current(self._engine_keys.index(usable[0]) if usable else 0)
+        self.on_engine_change()
 
     def _selected_engine_key(self):
         index = self.engine_combo.current()
@@ -1954,73 +1711,34 @@ class UnifiedTTSApp:
             self.speed_hint.config(text="install ffmpeg for speed control")
             self.speed_hint.pack(side=tk.LEFT, padx=8)
 
-    def on_language_change(self, event=None):
-        """Cache the language code so the playback thread never reads a Tk var."""
-        selection = self.lang_combo.get()
-        if "(" in selection and ")" in selection:
-            self._current_language = selection.split("(")[1].split(")")[0]
-
     def on_engine_change(self, event=None):
-        """Switch engine: show its options, warm up its model, and carry on
+        """Switch engine: show its voices, warm up its model, and carry on
         playing in the new voice if something was playing."""
         key = self._selected_engine_key()
         engine = self.engines.get(key)
+        if engine is None:
+            return
         previous = self.current_engine
         self._preload_token += 1   # a load still running for the old pick is moot
         self._loading_message = None
-
-        self.download_button.pack_forget()
-        self.lang_frame.pack_forget()
         self.voice_frame.pack_forget()
 
-        # Only a selected neural engine that can run may use the voice worker.
-        # Picking anything else -- including one that cannot run here --
-        # shuts it down, so a 24 GB model never lingers.
-        if isinstance(engine, NeuralTTSEngine) and not engine.unavailable_reason():
-            self.voice_client.set_active(key)
-        else:
+        reason = engine.unavailable_reason()
+        if reason:
+            # Nothing will play, so nothing may stay loaded either
             self.voice_client.close()
-
-        if isinstance(engine, NeuralTTSEngine):
-            reason = engine.unavailable_reason()
-            if reason:
-                self.current_engine = None
-                self._set_play_button_enabled(False)
-                self.status_label.config(text=f"{engine.spec.name}: {reason}  ·  {engine.spec.detail}",
-                                         fg=self.ACCENT_ORANGE)
-            else:
-                self.current_engine = engine
-                self._show_voice_choices(engine.spec)
-                self._set_play_button_enabled(True)
-                self._update_speed_availability()
-                self._preload(engine)
-
-        elif key == 'google' and engine.is_available():
-            self.current_engine = engine
-            self.lang_frame.pack(side=tk.LEFT, padx=(16, 0), before=self.engine_status)
-            self._set_play_button_enabled(True)
-            self.status_label.config(text="Ready - Google TTS", fg=self.ACCENT_GREEN)
-            self._update_speed_availability()
-
-        elif key == 'piper' and engine.is_available():
-            self.current_engine = engine
-            self._set_play_button_enabled(True)
-            self.status_label.config(text="Ready - Piper TTS", fg=self.ACCENT_GREEN)
-            self._update_speed_availability()
-
-        elif key == 'piper' and engine.check_piper_installed():
             self.current_engine = None
             self._set_play_button_enabled(False)
-            self.download_button.pack(side=tk.LEFT, padx=20)
-            self.status_label.config(text="Download voice model to use Piper TTS", fg=self.ACCENT_ORANGE)
-
+            self.status_label.config(text=f"{engine.spec.name}: {reason}  \u00b7  {engine.spec.detail}",
+                                     fg=self.ACCENT_ORANGE)
         else:
-            self.current_engine = None
-            self._set_play_button_enabled(False)
-            if key == 'google':
-                self.status_label.config(text="Install: pip install gtts pygame", fg=self.ACCENT_ORANGE)
-            else:
-                self.status_label.config(text="Install: pip install piper-tts", fg=self.ACCENT_ORANGE)
+            # Only the selected engine may use the voice worker
+            self.voice_client.set_active(key)
+            self.current_engine = engine
+            self._show_voice_choices(engine.spec)
+            self._set_play_button_enabled(True)
+            self._update_speed_availability()
+            self._preload(engine)
 
         if self.current_engine is not previous:
             self._engine_switched(previous)
@@ -2095,36 +1813,6 @@ class UnifiedTTSApp:
             return  # "Speaking..." is the more useful status while playing
         self.status_label.config(text=message, fg=color)
     
-    def download_piper_model(self):
-        """Download Piper voice model"""
-        self.download_button.config(state="disabled", text="Downloading...")
-        self.status_label.config(text="Downloading voice model...", fg=self.ACCENT_BLUE)
-
-        def download_thread():
-            def update_status(msg):
-                self._post(lambda: self.status_label.config(text=msg, fg=self.ACCENT_BLUE))
-            
-            success = self.engines['piper'].download_model(update_status)
-            
-            if success:
-                self._post(self.refresh_engines_after_download)
-            else:
-                self._post(lambda: self.download_button.config(state="normal", text="Download Voice Model"))
-        
-        thread = threading.Thread(target=download_thread, daemon=True)
-        thread.start()
-    
-    def refresh_engines_after_download(self):
-        """Refresh engine list after downloading Piper model"""
-        self.download_button.pack_forget()
-        self.engines['piper'].invalidate_availability()
-        self.check_engines_and_initialize()
-
-        # Select Piper TTS if now available
-        if self.engines['piper'].is_available():
-            self.engine_combo.current(self._engine_keys.index('piper'))
-            self.on_engine_change()
-    
     def update_speed_label(self, value):
         """Update the speed label and the thread-safe speed mirror."""
         speed = float(value)
@@ -2178,15 +1866,13 @@ class UnifiedTTSApp:
         self._start_playback()
 
     def _playback_params(self):
-        """Speed and language for the next sentence.
+        """Speed and voice for the next sentence.
 
         Read from plain attributes rather than the Tk variables: this is called
         on the playback thread, and Tk variables are not safe to touch there.
         """
         kwargs = {}
-        if isinstance(self.current_engine, GoogleTTSEngine):
-            kwargs["language"] = self._current_language
-        elif isinstance(self.current_engine, NeuralTTSEngine):
+        if isinstance(self.current_engine, NeuralTTSEngine):
             kwargs["voice"] = self._current_voice or self.current_engine.spec.default_voice
         return self._current_speed, kwargs
 
@@ -2282,7 +1968,7 @@ class UnifiedTTSApp:
             self.playback.start_playback_thread()
 
     def _on_generating(self):
-        # The first sentence after picking a heavy voice waits on the model
+        # The first sentence after picking a bigger voice waits on the model
         # loading; say that, rather than imply the sentence itself is slow.
         text = self._loading_message or "Generating audio\u2026"
         self.status_label.config(text=text, fg=self.ACCENT_BLUE)
@@ -2379,62 +2065,26 @@ class UnifiedTTSApp:
 
 
 def check_dependencies():
-    """Check and display available dependencies"""
+    """Print what the app needs and whether each piece is here (--check)."""
     print("Text-to-Speech Application")
     print("=" * 40)
-    print("Checking dependencies...")
+    checks = [
+        ("pygame (audio playback)", PYGAME_AVAILABLE, "pip install pygame"),
+        ("ffmpeg (speed control)", ffmpeg_available(), "brew install ffmpeg"),
+        ("voices environment", os.path.exists(voice_catalog.voices_python()),
+         "see Quick Start in the README"),
+        ("espeak-ng (Kokoro)", voice_catalog.espeak_paths() is not None,
+         "brew install espeak-ng"),
+    ]
+    for name, ok, fix in checks:
+        mark = "\u2713" if ok else "\u2717"
+        print(f"{mark} {name}" + ("" if ok else f"  -- {fix}"))
     print()
-    
-    deps = {
-        'gtts': GTTS_AVAILABLE,
-        'pygame': PYGAME_AVAILABLE
-    }
-    
-    available = []
-    missing = []
-    
-    for dep, status in deps.items():
-        if status:
-            available.append(dep)
-            print(f"✓ {dep} - Available")
-        else:
-            missing.append(dep)
-            print(f"✗ {dep} - Not installed")
-    
-    # Check for Piper (cross-platform)
-    piper_available = False
-    try:
-        result = subprocess.run(["piper", "--help"], capture_output=True, text=True, timeout=2)
-        if result.returncode == 0:
-            piper_available = True
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        piper_available = False
-    
-    if piper_available:
-        print("✓ piper - Available")
-        available.append('piper')
-    else:
-        print("✗ piper - Not installed")
-        missing.append('piper')
-    
-    print()
-    
-    if missing:
-        print("To install missing dependencies:")
-        print("-" * 40)
-        if 'gtts' in missing or 'pygame' in missing:
-            python_deps = [d for d in missing if d in ['gtts', 'pygame']]
-            print(f"pip install {' '.join(python_deps)}")
-        if 'piper' in missing:
-            print("pip install piper-tts")
-        print()
-    
-    if not PYGAME_AVAILABLE:
-        print("WARNING: pygame is required for audio playback!")
-        print("Install with: pip install pygame")
-        return False
-    
-    return True
+    for spec in voice_catalog.ENGINES:
+        reason = voice_catalog.unavailable_reason(spec)
+        mark = "\u2717" if reason else "\u2713"
+        print(f"{mark} {spec.name}" + (f"  -- {reason}" if reason else ""))
+    return PYGAME_AVAILABLE
 
 
 def main():

@@ -244,7 +244,7 @@ class TestStartupRaces:
         c.set_active("fake")
         t, outcome = load_in_background(c, "fake")
         time.sleep(0.2)
-        c.close()                       # the user picked Piper
+        c.close()                       # the user closed the app
         t.join(15)
         time.sleep(0.5)
         alive = [p for p in spawned if p.poll() is None]
@@ -286,45 +286,3 @@ class TestLongLoads:
             c.load("fake")
         finally:
             c.close()
-
-
-WRAPPED_WORKER = """
-import json, os, sys
-sys.path.insert(0, os.environ["REPO"])
-import numpy as np
-import voice_worker as w
-
-def record(*event):
-    with open(os.environ["ORDER_LOG"], "a") as f:
-        f.write(json.dumps(event) + "\\n")
-
-class Dummy:
-    def synth(self, text, voice, speed):
-        return np.full(1600, 0.1, dtype=np.float32), 16000
-
-w.make_engine = lambda key: (record("make_engine", key), Dummy())[1]
-w.ensure_reference = lambda voice, current=None: (record("ensure_reference", voice), ("r.wav", "r.txt"))[1]
-w.main()
-"""
-
-
-class TestReferenceVoiceOrder:
-    def test_reference_is_made_before_the_big_model_loads(self, tmp_path):
-        """Designing the reference loads Breeze (7.6 GB); doing it after
-        Drama 3 (24 GB) is in memory needs 32 GB at once."""
-        script = tmp_path / "wrapped.py"
-        script.write_text(WRAPPED_WORKER)
-        order_log = tmp_path / "order.jsonl"
-        c = VoiceWorkerClient(python=sys.executable, script=str(script),
-                              log_path=str(tmp_path / "worker.log"),
-                              extra_env={"REPO": REPO, "ORDER_LOG": str(order_log)})
-        c.START_TIMEOUT = c.SYNTH_TIMEOUT = 10
-        c.set_active("drama3")
-        c.load("drama3")
-        c.set_active("ming")
-        c.load("ming")
-        c.close()
-        import json
-        events = [json.loads(line) for line in order_log.read_text().splitlines()]
-        assert events == [["ensure_reference", "soothing"], ["make_engine", "drama3"],
-                          ["make_engine", "ming"]], events

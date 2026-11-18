@@ -433,3 +433,188 @@ class TestRemembersArticleAndShowsTimeLeft:
         label = out[1]
         assert "%" in label, f"lost the percentage: {label!r}"
         assert "sec" in label or "min" in label, f"no time estimate: {label!r}"
+
+
+# ── Neural voices in the engine dropdown ────────────────────────────────────
+
+import voice_catalog
+from tts_unified import NeuralTTSEngine
+
+
+class FakeVoiceClient:
+    """Stands in for the voice worker; records who asked for what."""
+
+    def __init__(self):
+        self.active = None
+        self.synths = []
+        self.loads = []
+        self.closed = 0
+
+    def set_active(self, key):
+        self.active = key
+
+    def load(self, key):
+        self.loads.append(key)
+        return 0.0
+
+    def synth(self, engine_key, text, voice, speed, out_path):
+        self.synths.append((engine_key, voice, text))
+        with open(out_path, "wb") as f:
+            f.write(b"RIFF")
+        return {"path": out_path}
+
+    def close(self):
+        self.active = None
+        self.closed += 1
+
+
+class NeuralHarness(AppHarness):
+    """The real app, with the neural engines wired to a fake worker and
+    treated as installed."""
+
+    def __init__(self, text, monkeypatch):
+        monkeypatch.setattr(voice_catalog, "unavailable_reason", lambda spec: "")
+        monkeypatch.setattr(voice_catalog, "is_downloaded", lambda repo: True)
+        super().__init__(text, store_dir=tempfile.mkdtemp())
+        self.client = FakeVoiceClient()
+        self.app.voice_client = self.client
+        for spec in voice_catalog.ENGINES:
+            self.app.engines[spec.key] = NeuralTTSEngine(spec, self.client)
+        self.app._current_speed = 1.0   # skip ffmpeg re-timing of the fake clips
+        self.app.check_engines_and_initialize()
+
+    def select(self, key):
+        self.app.engine_combo.current(self.app._engine_keys.index(key))
+        self.app.on_engine_change()
+
+
+class TestNeuralVoicesInTheDropdown:
+    def test_every_voice_is_listed_and_explained_when_not_set_up(self):
+        """Without the voices environment they still show, greyed out with a
+        reason, rather than silently missing."""
+        h = AppHarness(TEXT, store_dir=tempfile.mkdtemp())
+        labels = list(h.app.engine_combo["values"])
+        h.app.engine_combo.current(h.app._engine_keys.index("phonon"))
+        h.app.on_engine_change()
+        status = h.app.status_label.cget("text")
+        enabled = getattr(h.app.play_pause_button, "_enabled", True)
+        h.close()
+        for spec in voice_catalog.ENGINES:
+            assert any(label.startswith(spec.name) for label in labels), spec.name
+        assert "README" in status, status
+        assert enabled is False
+
+    def test_kokoro_heart_is_the_default_when_installed(self, monkeypatch):
+        h = NeuralHarness(TEXT, monkeypatch)
+        key = h.app._selected_engine_key()
+        voice = h.app._current_voice
+        voice_shown = h.app.voice_frame.winfo_manager() == "pack"
+        h.close()
+        assert (key, voice) == ("kokoro", "af_heart")
+        assert voice_shown, "no voice picker for a neural engine"
+
+    def test_phonon_takes_over_where_kokoro_cannot_run(self, monkeypatch):
+        """Kokoro needs an Apple Silicon Mac and espeak-ng; elsewhere the app
+        should still open on a neural voice."""
+        monkeypatch.setattr(voice_catalog, "is_downloaded", lambda repo: True)
+        h = NeuralHarness(TEXT, monkeypatch)
+        monkeypatch.setattr(voice_catalog, "unavailable_reason",
+                            lambda spec: "needs espeak-ng" if spec.key == "kokoro" else "")
+        h.app.check_engines_and_initialize()
+        key = h.app._selected_engine_key()
+        h.close()
+        assert key == "phonon"
+
+    def test_switching_engine_mid_playback_carries_on_in_the_new_one(self, monkeypatch):
+        h = NeuralHarness(TEXT, monkeypatch)
+        h.select("phonon")
+        out = h.run([
+            (0, h.app.on_play_pause),
+            (400, lambda: h.select("ming")),
+            (900, lambda: (h.app.playback.state.value, list(h.client.synths))),
+        ])
+        h.close()
+        state, synths = out[2]
+        assert state == "playing"
+        assert synths[0][0] == "phonon"
+        in_ming = [text for engine, _, text in synths if engine == "ming"]
+        assert in_ming, "kept talking in the old engine"
+        assert in_ming[0].startswith("Sentence number 1 "), "lost its place on the switch"
+
+    def test_changing_voice_mid_playback_is_heard_at_once(self, monkeypatch):
+        h = NeuralHarness(TEXT, monkeypatch)
+        h.select("phonon")
+        hugh = h.app._voice_ids.index("Hugh")
+
+        def pick_hugh():
+            h.app.voice_combo.current(hugh)
+            h.app.on_voice_change()
+
+        out = h.run([
+            (0, h.app.on_play_pause),
+            (400, pick_hugh),
+            (900, lambda: list(h.client.synths)),
+        ])
+        h.close()
+        synths = out[2]
+        assert synths[0][1] == "Everly"
+        in_hugh = [text for _, voice, text in synths if voice == "Hugh"]
+        assert in_hugh, "the new voice was never used"
+        assert in_hugh[0].startswith("Sentence number 1 "), "the change waited for the buffer"
+
+    def test_picking_a_voice_that_cannot_run_frees_the_loaded_one(self, monkeypatch):
+        """Drama 3 loaded, then "Kokoro · unavailable" picked: nothing will
+        play, so the 24 GB should not stay in memory either."""
+        h = NeuralHarness(TEXT, monkeypatch)
+        h.select("drama3")
+        before = h.client.closed
+        monkeypatch.setattr(voice_catalog, "unavailable_reason",
+                            lambda spec: "needs espeak-ng" if spec.key == "kokoro" else "")
+        h.select("kokoro")
+        closed, active = h.client.closed, h.client.active
+        h.close()
+        assert closed > before, "the previous model was left loaded"
+        assert active is None
+
+    def test_leaving_the_neural_voices_shuts_the_worker_down(self, monkeypatch):
+        """A heavy model should not sit in memory once you pick Piper or Google."""
+        h = NeuralHarness(TEXT, monkeypatch)
+        before = h.client.closed
+        target = "piper" if h.app.engines["piper"].is_available() else "google"
+        h.select(target)
+        closed = h.client.closed
+        h.close()
+        assert closed > before
+
+
+class TestPlaybackThreadNeverWaitsOnTheUI:
+    """Calling into Tk from the playback thread blocks until something else
+    wakes the event loop -- on macOS that could be seconds, and it was:
+    after an engine switch the new voice stayed silent until the next timer
+    or keypress happened along. UI updates must be posted, never awaited."""
+
+    def test_status_updates_from_the_playback_thread_never_wait_on_tk(self):
+        h = AppHarness(TEXT, store_dir=tempfile.mkdtemp())
+        h.app._wire_playback_callbacks()
+        result = {}
+
+        def from_playback_thread():
+            start = time.monotonic()
+            try:
+                h.app.playback.on_generating(0)
+                h.app.playback.on_sentence_start(0)
+                result["ok"] = True
+            except Exception as exc:  # noqa: BLE001 - reported below
+                result["error"] = exc
+            result["took"] = time.monotonic() - start
+
+        # The main thread is busy (here: joining), not servicing Tk -- the
+        # state that left playback stalled. A posted update must not care.
+        t = threading.Thread(target=from_playback_thread, daemon=True)
+        t.start()
+        t.join(3)
+        out = h.run([(300, lambda: h.app.status_label.cget("text"))])
+        h.close()
+        assert result.get("ok"), f"update from the playback thread failed: {result.get('error')!r}"
+        assert result["took"] < 0.2, f"playback thread waited {result['took']:.2f}s on Tk"
+        assert out[0] == "Speaking…", "the posted update never reached the UI"

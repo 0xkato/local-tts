@@ -18,8 +18,11 @@ import sys
 import tempfile
 import subprocess
 import shutil
+import queue
 from typing import Optional, Callable
 from abc import ABC, abstractmethod
+
+import voice_catalog
 
 # Required imports
 try:
@@ -703,6 +706,257 @@ class PiperTTSEngine(TTSEngine):
             return False
 
 
+# ── Neural voices ───────────────────────────────────────────────────────────
+# The neural models run in a worker process with its own environment (see
+# voice_worker.py): mlx-audio needs Python 3.11+, and a model of up to 24 GB
+# should neither share the UI's process nor stay in memory once the user has
+# switched to another engine.
+
+class VoiceSwitched(Exception):
+    """A request for an engine the user has since switched away from."""
+
+
+class VoiceWorkerClient:
+    """Talks to the voice worker: one request in flight, replies matched by id.
+
+    The worker is started on first use and replaced if it dies. Only the
+    engine the user has selected may use it: a stale lookahead thread asking
+    for the previous engine is refused here, so it cannot make the worker
+    reload a model the user just walked away from.
+    """
+
+    # Seconds of *silence* before the worker counts as stuck. It sends a
+    # heartbeat every few seconds while working, so a 24 GB first download
+    # may take as long as the connection needs.
+    START_TIMEOUT = 60
+    LOAD_TIMEOUT = 120
+    SYNTH_TIMEOUT = 120
+
+    def __init__(self, python=None, script=None, log_path=None, extra_env=None):
+        self.python = python or voice_catalog.voices_python()
+        self.script = script or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "voice_worker.py")
+        self.log_path = log_path or voice_catalog.WORKER_LOG
+        self.extra_env = dict(extra_env or {})
+        self._proc = None
+        self._replies = None
+        self._request_lock = threading.Lock()   # serialises requests
+        self._state_lock = threading.Lock()     # guards the fields below
+        self._active = None
+        self._loading = None
+        self._loaded = None
+        self._next_id = 1
+
+    @property
+    def pid(self) -> Optional[int]:
+        proc = self._proc
+        return proc.pid if proc is not None and proc.poll() is None else None
+
+    def set_active(self, engine_key: Optional[str]) -> None:
+        """Select which engine may use the worker. Switching away from an
+        engine that is still loading kills the load rather than wait it out."""
+        with self._state_lock:
+            self._active = engine_key
+            abort = self._loading is not None and self._loading != engine_key
+        if abort:
+            self._kill()
+
+    def load(self, engine_key: str) -> float:
+        """Bring a model into memory ahead of the first sentence."""
+        return self._request("load", engine_key, self.LOAD_TIMEOUT)["load_s"]
+
+    def synth(self, engine_key, text, voice, speed, out_path) -> dict:
+        return self._request("synth", engine_key, self.SYNTH_TIMEOUT, text=text,
+                             voice=voice, speed=float(speed), out=out_path)
+
+    def close(self) -> None:
+        with self._state_lock:
+            self._active = None
+        self._kill()
+
+    # ── internals ──
+
+    def _refuse_if_stale(self, engine_key):
+        with self._state_lock:
+            if engine_key != self._active:
+                raise VoiceSwitched(f"{engine_key} is no longer the selected engine")
+
+    def _request(self, op, engine_key, timeout, **fields):
+        self._refuse_if_stale(engine_key)
+        with self._request_lock:
+            # The stale check and the claim are one step: from here on, a
+            # switch to another engine kills this request -- start-up included.
+            self._claim(engine_key)
+            try:
+                if self.pid is None:
+                    self._spawn()
+                # A switch during start-up had no process to kill yet.
+                with self._state_lock:
+                    stale, closed = engine_key != self._active, self._active is None
+                if stale:
+                    if closed:
+                        self._kill()
+                    raise VoiceSwitched(f"{engine_key} is no longer the selected engine")
+                proc, replies = self._proc, self._replies
+                if proc is None:
+                    raise RuntimeError("the voice worker stopped unexpectedly")
+                request_id = self._next_id
+                self._next_id += 1
+                message = dict(fields, id=request_id, op=op, engine=engine_key)
+                try:
+                    proc.stdin.write(json.dumps(message) + "\n")
+                    proc.stdin.flush()
+                except (BrokenPipeError, OSError, ValueError):
+                    self._kill()
+                    raise RuntimeError("the voice worker stopped unexpectedly")
+                reply = self._await(replies, request_id, timeout)
+                with self._state_lock:
+                    # The worker says what it holds; after a failed load that
+                    # is nothing, whatever was loaded before.
+                    self._loaded = reply.get("loaded")
+            finally:
+                with self._state_lock:
+                    if self._loading == engine_key:
+                        self._loading = None
+        if not reply.get("ok"):
+            raise RuntimeError(reply.get("error") or "voice worker error")
+        return reply
+
+    def _claim(self, engine_key):
+        alive = self.pid is not None   # a dead worker holds nothing, whatever we last heard
+        with self._state_lock:
+            if engine_key != self._active:
+                raise VoiceSwitched(f"{engine_key} is no longer the selected engine")
+            if engine_key != self._loaded or not alive:
+                self._loading = engine_key   # this request may (re)load a model
+
+    def _spawn(self):
+        if not os.path.exists(self.python):
+            raise RuntimeError(
+                f"voices environment not found at {self.python} -- see the README")
+        os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
+        env = dict(os.environ, PYTHONUNBUFFERED="1", **self.extra_env)
+        with open(self.log_path, "a") as log:
+            proc = subprocess.Popen(
+                [self.python, self.script], stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE, stderr=log, text=True, bufsize=1, env=env,
+            )
+        replies = queue.Queue()
+        threading.Thread(target=self._read, args=(proc, replies), daemon=True).start()
+        self._proc, self._replies = proc, replies
+        with self._state_lock:
+            self._loaded = None
+        self._await(replies, 0, self.START_TIMEOUT)
+
+    @staticmethod
+    def _read(proc, replies):
+        for line in proc.stdout:
+            try:
+                replies.put(json.loads(line))
+            except ValueError:
+                pass
+        replies.put(None)   # end of stream: the worker is gone
+
+    def _await(self, replies, request_id, timeout):
+        """Wait for a reply. `timeout` is how long the worker may stay silent:
+        each heartbeat for this request pushes the deadline back."""
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._kill()
+                raise RuntimeError("the voice worker stopped responding")
+            try:
+                reply = replies.get(timeout=remaining)
+            except queue.Empty:
+                continue
+            if reply is None:
+                with self._state_lock:
+                    self._loaded = None
+                raise RuntimeError(
+                    f"the voice worker exited -- details in {self.log_path}")
+            if reply.get("id") != request_id:
+                continue   # the late answer to a request that timed out
+            if reply.get("heartbeat"):
+                deadline = time.monotonic() + timeout
+                continue
+            return reply
+
+    def _kill(self):
+        proc = self._proc
+        self._proc = None
+        with self._state_lock:
+            self._loaded = None
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+
+
+class NeuralTTSEngine(TTSEngine):
+    """One model in the voice worker, e.g. Phonon or Drama 3."""
+
+    def __init__(self, spec: "voice_catalog.EngineSpec", client: VoiceWorkerClient):
+        self.spec = spec
+        self.client = client
+
+    def generate(self, text: str, speed: float, voice: Optional[str] = None, **kwargs) -> str:
+        fd, path = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+        native = self.spec.native_speed
+        try:
+            self.client.synth(self.spec.key, text, voice=voice or self.spec.default_voice,
+                              speed=speed if native else 1.0, out_path=path)
+        except Exception:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            raise
+        # Models without a speed control are re-timed like Google's clips are
+        return path if native else time_stretch(path, speed)
+
+    def speak(self, text: str, speed: float, callback: Optional[Callable] = None) -> None:
+        path = None
+        try:
+            path = self.generate(text, speed)
+            pygame.mixer.music.load(path)
+            pygame.mixer.music.play()
+            while pygame.mixer.music.get_busy():
+                pygame.time.Clock().tick(10)
+        finally:
+            if path and os.path.exists(path):
+                os.unlink(path)
+            if callback:
+                callback()
+
+    def stop(self) -> None:
+        if PYGAME_AVAILABLE:
+            pygame.mixer.music.stop()
+
+    def unavailable_reason(self) -> str:
+        if not PYGAME_AVAILABLE:
+            return "needs pygame"
+        return voice_catalog.unavailable_reason(self.spec)
+
+    def is_available(self) -> bool:
+        return not self.unavailable_reason()
+
+    def is_downloaded(self) -> bool:
+        return voice_catalog.is_downloaded(self.spec.repo)
+
+    def get_name(self) -> str:
+        return self.spec.name
+
+    def supports_speed(self) -> bool:
+        return self.spec.native_speed or ffmpeg_available()
+
+    def preload(self) -> float:
+        return self.client.load(self.spec.key)
+
+
 class AudioPlayer:
     """pygame.mixer.music behind a swappable interface, so playback logic can
     be exercised without an audio device."""
@@ -767,6 +1021,7 @@ class PlaybackController:
         self._buffer = {}        # buffer key -> generated audio file path
         self._inflight = {}      # buffer key -> Event, set when generation ends
         self._errors = {}        # buffer key -> exception from a failed generate
+        self._epoch = 0          # bumped by cleanup_buffer: older generations are void
         self._buffer_lock = threading.Lock()
         self._active_path = None
 
@@ -891,10 +1146,12 @@ class PlaybackController:
 
     # ── Audio generation and buffering ──────────────────────────────────
 
-    def _buffer_key(self, index: int, speed: float, kwargs: dict) -> tuple:
-        """Speed and language are part of the key: audio cached at 1.0x must not
-        be replayed after the user drags the speed slider to 2.0x."""
-        return (index, round(float(speed), 3), tuple(sorted(kwargs.items())))
+    def _buffer_key(self, index: int, speed: float, kwargs: dict, engine=None) -> tuple:
+        """Speed, language/voice and the engine are all part of the key: audio
+        cached at 1.0x must not be replayed at 2.0x, nor Breeze's "soothing"
+        voice played as Drama 3's."""
+        engine = self.engine if engine is None else engine
+        return (index, round(float(speed), 3), tuple(sorted(kwargs.items())), id(engine))
 
     def generate_sentence(self, index: int, speed: float, **kwargs) -> Optional[str]:
         """Return a playable audio file for a sentence, generating it once.
@@ -909,8 +1166,10 @@ class PlaybackController:
         if not spoken:
             return None
 
-        key = self._buffer_key(index, speed, kwargs)
+        engine = self.engine
+        key = self._buffer_key(index, speed, kwargs, engine)
         with self._buffer_lock:
+            epoch = self._epoch
             path = self._buffer.get(key)
             if path and os.path.exists(path):
                 return path
@@ -922,25 +1181,45 @@ class PlaybackController:
                 self._errors.pop(key, None)
 
         if not owner:
-            done.wait(timeout=self.GENERATE_TIMEOUT)
+            if not done.wait(timeout=self.GENERATE_TIMEOUT):
+                # Raised, not returned as None: None means "nothing to say",
+                # and the sentence would be skipped without a word.
+                raise TimeoutError(f"sentence {index + 1} is still being generated")
             with self._buffer_lock:
                 error = self._errors.get(key)
                 if error is not None:
                     raise error
-                return self._buffer.get(key)
+                path = self._buffer.get(key)
+            if path is None:
+                raise RuntimeError(f"sentence {index + 1} was superseded while generating")
+            return path
 
         try:
-            audio_path = self.engine.generate(spoken, speed, **kwargs)
+            audio_path = engine.generate(spoken, speed, **kwargs)
         except Exception as exc:
             with self._buffer_lock:
-                self._errors[key] = exc
-                self._inflight.pop(key, None)
+                if self._epoch == epoch:
+                    self._errors[key] = exc
+                if self._inflight.get(key) is done:
+                    self._inflight.pop(key)
             done.set()
             raise
         with self._buffer_lock:
-            self._buffer[key] = audio_path
-            self._inflight.pop(key, None)
+            current = self._epoch == epoch
+            if current:
+                self._buffer[key] = audio_path
+            # Only our own marker: after a clear, the key may be someone else's
+            if self._inflight.get(key) is done:
+                self._inflight.pop(key)
         done.set()
+        if not current:
+            # The buffer was cleared while this clip generated (engine switch,
+            # stop, new text): it belongs to no one now.
+            try:
+                os.unlink(audio_path)
+            except OSError:
+                pass
+            raise RuntimeError(f"sentence {index + 1} was superseded while generating")
         return audio_path
 
     def is_buffered(self, index: int, speed: float, **kwargs) -> bool:
@@ -952,24 +1231,28 @@ class PlaybackController:
 
     def _start_lookahead(self, index: int, speed: float, kwargs: dict, gen: int) -> None:
         """Pre-generate the next few sentences while this one plays, so a skip
-        forward lands on audio that is already waiting."""
-        for offset in range(1, self.LOOKAHEAD + 1):
-            ahead = index + offset
-            if ahead >= self.total_sentences:
-                break
-            threading.Thread(
-                target=self._lookahead_worker,
-                args=(ahead, speed, dict(kwargs), gen),
-                daemon=True,
-            ).start()
+        forward lands on audio that is already waiting.
+
+        One sentence at a time, nearest first: the neural voices run one
+        request at a time anyway, and parallel requests would only queue up,
+        with the sentence needed next stuck behind the ones after it.
+        """
+        threading.Thread(
+            target=self._lookahead_worker,
+            args=(index, speed, dict(kwargs), gen),
+            daemon=True,
+        ).start()
 
     def _lookahead_worker(self, index: int, speed: float, kwargs: dict, gen: int) -> None:
-        if not self.is_current(gen):
-            return
-        try:
-            self.generate_sentence(index, speed, **kwargs)
-        except Exception:
-            pass  # a failed pre-fetch is retried, and reported, on arrival
+        for ahead in range(index + 1, min(index + self.LOOKAHEAD, self.total_sentences - 1) + 1):
+            # Re-checked per sentence, so a skip retires the old lookahead
+            # after at most the one request already in flight.
+            if not self.is_current(gen):
+                return
+            try:
+                self.generate_sentence(ahead, speed, **kwargs)
+            except Exception:
+                pass  # a failed pre-fetch is retried, and reported, on arrival
 
     def prune_buffer(self, current_index: int) -> None:
         """Drop cached audio outside the window around the current sentence."""
@@ -1078,6 +1361,7 @@ class PlaybackController:
 
     def cleanup_buffer(self):
         with self._buffer_lock:
+            self._epoch += 1    # generations still running now store nothing
             for path in self._buffer.values():
                 if path and os.path.exists(path):
                     try:
@@ -1136,11 +1420,24 @@ class UnifiedTTSApp:
         if PYGAME_AVAILABLE:
             pygame.mixer.init()
 
-        # Initialize engines
+        # Initialize engines: the neural voices share one worker process
+        self.voice_client = VoiceWorkerClient()
         self.engines = {
             'google': GoogleTTSEngine(),
             'piper': PiperTTSEngine()
         }
+        for spec in voice_catalog.ENGINES:
+            self.engines[spec.key] = NeuralTTSEngine(spec, self.voice_client)
+        self._engine_keys = []       # dropdown index -> engine key
+        self._voice_ids = []         # voice dropdown index -> voice id
+        self._voice_for_engine = {}  # engine key -> voice last picked for it
+        self._current_voice = None   # mirror read by the playback thread
+        self._preload_token = 0
+        # Worker threads hand UI work over through this queue; only the Tk
+        # thread ever touches Tk (see _post).
+        self._ui_calls = queue.SimpleQueue()
+        self._ui_poll_id = None
+        self._loading_message = None  # set while a model is loading
 
         self.current_engine = None
         self.session_store = session_store if session_store is not None else SessionStore()
@@ -1153,6 +1450,7 @@ class UnifiedTTSApp:
         self._suppress_seek = False
 
         self.create_ui()
+        self._drain_ui_calls()
         self._bind_shortcuts()
         self._restore_last_text()
         self.check_engines_and_initialize()
@@ -1206,12 +1504,13 @@ class UnifiedTTSApp:
             font=("Helvetica", 30, "bold"), fg=self.FG, bg=self.BG,
         ).pack()
         tk.Label(
-            title_frame, text="Powered by Google TTS and Piper TTS",
+            title_frame, text="Neural voices, Piper and Google TTS",
             font=("Helvetica", 12), fg=self.FG_DIM, bg=self.BG,
         ).pack()
 
         # ── Engine selection row ──
         engine_frame = tk.Frame(main_frame, bg=self.BG)
+        self.engine_frame = engine_frame
         engine_frame.pack(pady=8, fill='x')
 
         tk.Label(
@@ -1222,7 +1521,7 @@ class UnifiedTTSApp:
         self.engine_var = tk.StringVar()
         self.engine_combo = ttk.Combobox(
             engine_frame, textvariable=self.engine_var,
-            state="readonly", width=35, font=("Helvetica", 12),
+            state="readonly", width=38, font=("Helvetica", 12),
         )
         self.engine_combo.pack(side=tk.LEFT, padx=5)
         self.engine_combo.bind('<<ComboboxSelected>>', self.on_engine_change)
@@ -1267,8 +1566,9 @@ class UnifiedTTSApp:
         controls_frame = tk.Frame(main_frame, bg=self.BG)
         controls_frame.pack(pady=(12, 0), fill='x', expand=False)
 
-        # Language selection (for Google TTS)
-        self.lang_frame = tk.Frame(controls_frame, bg=self.BG)
+        # Language (Google) and voice (neural engines) sit on the engine row:
+        # a row of their own pushed the controls past the window's height.
+        self.lang_frame = tk.Frame(self.engine_frame, bg=self.BG)
 
         tk.Label(
             self.lang_frame, text="Language:", font=("Helvetica", 12),
@@ -1291,9 +1591,21 @@ class UnifiedTTSApp:
         self.lang_combo.bind('<<ComboboxSelected>>', self.on_language_change)
         self.lang_combo.pack(side=tk.LEFT, padx=5)
 
+        self.voice_frame = tk.Frame(self.engine_frame, bg=self.BG)
+        tk.Label(
+            self.voice_frame, text="Voice:", font=("Helvetica", 12),
+            fg=self.FG, bg=self.BG,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        self.voice_combo = ttk.Combobox(
+            self.voice_frame, state="readonly", width=24, font=("Helvetica", 11),
+        )
+        self.voice_combo.bind('<<ComboboxSelected>>', self.on_voice_change)
+        self.voice_combo.pack(side=tk.LEFT, padx=5)
+
         # Speed control
         speed_frame = tk.Frame(controls_frame, bg=self.BG)
         speed_frame.pack(pady=8)
+        self.speed_frame = speed_frame
 
         tk.Label(
             speed_frame, text="Speed:", font=("Helvetica", 12),
@@ -1471,57 +1783,75 @@ class UnifiedTTSApp:
             c.configure(cursor="")
             c._enabled = False
 
+    # Dropdown order, as listed in voice_catalog; the first usable one is the default
+    ENGINE_ORDER = tuple(spec.key for spec in voice_catalog.ENGINES) + ('piper', 'google')
+
+    def _engine_entry(self, key):
+        """(dropdown label, usable) for one engine."""
+        engine = self.engines[key]
+        if isinstance(engine, NeuralTTSEngine):
+            spec = engine.spec
+            if engine.unavailable_reason():
+                return f"{spec.label} · unavailable", False
+            if not engine.is_downloaded():
+                return f"{spec.label} · {spec.download_size} download", True
+            return spec.label, True
+        if key == 'piper':
+            if engine.is_available():
+                return "Piper TTS (Offline)", True
+            if engine.check_piper_installed():
+                return "Piper TTS (Model Not Downloaded)", False
+            return "Piper TTS (Not Installed - pip install piper-tts)", False
+        if engine.is_available():
+            return "Google TTS (Online)", True
+        return "Google TTS (Not Available - Install gtts & pygame)", False
+
+    UI_POLL_MS = 40
+
+    def _post(self, fn):
+        """Run fn on the Tk thread. Safe from any thread.
+
+        Calling into Tk from a worker thread -- even root.after -- waits for
+        the Tk thread to service it, and on macOS that can mean waiting until
+        some unrelated event (a timer, a keypress) wakes the loop: playback
+        sat silent for seconds after an engine switch. A queue drained by
+        the Tk thread never makes the caller wait.
+        """
+        self._ui_calls.put(fn)
+
+    def _drain_ui_calls(self):
+        while True:
+            try:
+                fn = self._ui_calls.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                fn()
+            except Exception:  # noqa: BLE001 - one bad update must not stop the rest
+                import traceback
+                traceback.print_exc()
+        self._ui_poll_id = self.root.after(self.UI_POLL_MS, self._drain_ui_calls)
+
     def check_engines_and_initialize(self):
-        """Check available engines and initialize"""
-        available_engines = []
-        engine_items = []
-        
-        # Check Piper TTS FIRST (so it appears first in dropdown)
-        piper_engine = self.engines['piper']
-        if piper_engine.is_available():
-            available_engines.append('piper')
-            engine_items.append("Piper TTS (Offline)")
-        elif piper_engine.check_piper_installed():
-            engine_items.append("Piper TTS (Model Not Downloaded)")
-        else:
-            engine_items.append("Piper TTS (Not Installed - pip install piper-tts)")
-        
-        # Check Google TTS SECOND
-        if self.engines['google'].is_available():
-            available_engines.append('google')
-            engine_items.append("Google TTS (Online)")
-        else:
-            engine_items.append("Google TTS (Not Available - Install gtts & pygame)")
-        
-        self.engine_combo['values'] = engine_items
-        
-        # Always select first item in list (Piper will be first if available)
-        if available_engines:
-            # Select the first available engine in the dropdown
-            self.engine_combo.current(0)
-            
-            # Set the current engine based on what's first
-            first_item = engine_items[0]
-            if "Piper TTS (Offline)" in first_item:
-                self.current_engine = self.engines['piper']
-            elif "Google TTS (Online)" in first_item:
-                self.current_engine = self.engines['google']
-            else:
-                # Neither is fully available, but set based on what's selected
-                for engine_key in available_engines:
-                    if engine_key == 'piper' and "Piper" in first_item:
-                        self.current_engine = self.engines['piper']
-                        break
-                    elif engine_key == 'google' and "Google" in first_item:
-                        self.current_engine = self.engines['google']
-                        break
-            
+        """List every engine, and select the first one that can run here."""
+        entries = [(key,) + self._engine_entry(key) for key in self.ENGINE_ORDER]
+        self._engine_keys = [key for key, _, _ in entries]
+        self.engine_combo['values'] = [label for _, label, _ in entries]
+        usable = [key for key, _, ok in entries if ok]
+
+        if usable:
+            self.engine_combo.current(self._engine_keys.index(usable[0]))
             self.on_engine_change()
-            self.status_label.config(text="Ready", fg=self.ACCENT_GREEN)
         else:
             self.engine_combo.current(0)
             self.status_label.config(text="No TTS engines available. Please install dependencies.", fg=self.ACCENT_RED)
             self._set_play_button_enabled(False)
+
+    def _selected_engine_key(self):
+        index = self.engine_combo.current()
+        if 0 <= index < len(self._engine_keys):
+            return self._engine_keys[index]
+        return None
     
     SPEED_STEP = 0.1
 
@@ -1631,29 +1961,55 @@ class UnifiedTTSApp:
             self._current_language = selection.split("(")[1].split(")")[0]
 
     def on_engine_change(self, event=None):
-        """Handle engine selection change"""
-        selection = self.engine_combo.get()
-        
-        # Hide download button by default
+        """Switch engine: show its options, warm up its model, and carry on
+        playing in the new voice if something was playing."""
+        key = self._selected_engine_key()
+        engine = self.engines.get(key)
+        previous = self.current_engine
+        self._preload_token += 1   # a load still running for the old pick is moot
+        self._loading_message = None
+
         self.download_button.pack_forget()
-        
-        if "Google TTS (Online)" in selection:
-            self.current_engine = self.engines['google']
-            self.lang_frame.pack(pady=10)
+        self.lang_frame.pack_forget()
+        self.voice_frame.pack_forget()
+
+        # Only a selected neural engine that can run may use the voice worker.
+        # Picking anything else -- including one that cannot run here --
+        # shuts it down, so a 24 GB model never lingers.
+        if isinstance(engine, NeuralTTSEngine) and not engine.unavailable_reason():
+            self.voice_client.set_active(key)
+        else:
+            self.voice_client.close()
+
+        if isinstance(engine, NeuralTTSEngine):
+            reason = engine.unavailable_reason()
+            if reason:
+                self.current_engine = None
+                self._set_play_button_enabled(False)
+                self.status_label.config(text=f"{engine.spec.name}: {reason}  ·  {engine.spec.detail}",
+                                         fg=self.ACCENT_ORANGE)
+            else:
+                self.current_engine = engine
+                self._show_voice_choices(engine.spec)
+                self._set_play_button_enabled(True)
+                self._update_speed_availability()
+                self._preload(engine)
+
+        elif key == 'google' and engine.is_available():
+            self.current_engine = engine
+            self.lang_frame.pack(side=tk.LEFT, padx=(16, 0), before=self.engine_status)
             self._set_play_button_enabled(True)
             self.status_label.config(text="Ready - Google TTS", fg=self.ACCENT_GREEN)
             self._update_speed_availability()
 
-        elif "Piper TTS (Offline)" in selection:
-            self.current_engine = self.engines['piper']
-            self.lang_frame.pack_forget()
+        elif key == 'piper' and engine.is_available():
+            self.current_engine = engine
             self._set_play_button_enabled(True)
             self.status_label.config(text="Ready - Piper TTS", fg=self.ACCENT_GREEN)
             self._update_speed_availability()
 
-        elif "Model Not Downloaded" in selection:
+        elif key == 'piper' and engine.check_piper_installed():
             self.current_engine = None
-            self.lang_frame.pack_forget()
             self._set_play_button_enabled(False)
             self.download_button.pack(side=tk.LEFT, padx=20)
             self.status_label.config(text="Download voice model to use Piper TTS", fg=self.ACCENT_ORANGE)
@@ -1661,10 +2017,83 @@ class UnifiedTTSApp:
         else:
             self.current_engine = None
             self._set_play_button_enabled(False)
-            if "Google" in selection:
+            if key == 'google':
                 self.status_label.config(text="Install: pip install gtts pygame", fg=self.ACCENT_ORANGE)
             else:
                 self.status_label.config(text="Install: pip install piper-tts", fg=self.ACCENT_ORANGE)
+
+        if self.current_engine is not previous:
+            self._engine_switched(previous)
+
+    def _engine_switched(self, previous):
+        """Audio cached from the old engine must not be replayed by the new
+        one; if it was playing, pick the sentence up again in the new voice."""
+        was_playing = self.playback.state == PlaybackController.State.PLAYING
+        self.playback.cancel()
+        self.playback.cleanup_buffer()
+        if not was_playing:
+            return
+        if self.current_engine is None:
+            self.on_stop()
+            return
+        self.playback.engine = self.current_engine
+        self._schedule_restart()
+
+    def _show_voice_choices(self, spec):
+        self._voice_ids = [voice for voice, _ in spec.voices]
+        self.voice_combo['values'] = [label for _, label in spec.voices]
+        voice = self._voice_for_engine.get(spec.key, spec.default_voice)
+        self.voice_combo.current(self._voice_ids.index(voice))
+        self._current_voice = voice
+        self.voice_frame.pack(side=tk.LEFT, padx=(16, 0), before=self.engine_status)
+
+    def on_voice_change(self, event=None):
+        index = self.voice_combo.current()
+        if not (0 <= index < len(self._voice_ids)) or not isinstance(self.current_engine, NeuralTTSEngine):
+            return
+        voice = self._voice_ids[index]
+        if voice == self._current_voice:
+            return
+        self._current_voice = voice
+        self._voice_for_engine[self.current_engine.spec.key] = voice
+        if self.playback.state == PlaybackController.State.PLAYING:
+            # Hear the new voice now, not three buffered sentences from now
+            self.playback.cancel()
+            self._schedule_restart()
+
+    def _preload(self, engine):
+        """Load the model in the background as soon as it is picked, so the
+        first sentence does not wait on it. A newer pick supersedes this one."""
+        self._preload_token += 1
+        token = self._preload_token
+        name = engine.spec.name
+        note = "" if engine.is_downloaded() else f" (downloading {engine.spec.download_size})"
+        self._loading_message = f"Loading {name}…{note}"
+        self.status_label.config(text=f"{self._loading_message}  ·  {engine.spec.detail}",
+                                 fg=self.ACCENT_BLUE)
+
+        def work():
+            try:
+                seconds = engine.preload()
+                message, color = f"Ready - {name}", self.ACCENT_GREEN
+                if seconds >= 3:
+                    message += f" (loaded in {seconds:.0f}s)"
+                message += f"  ·  {engine.spec.detail}"
+            except VoiceSwitched:
+                return
+            except Exception as exc:
+                message, color = f"{name} failed to load: {exc}", self.ACCENT_RED
+            self._post(lambda: self._preload_done(token, message, color))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _preload_done(self, token, message, color):
+        if token != self._preload_token:
+            return
+        self._loading_message = None
+        if self.playback.state == PlaybackController.State.PLAYING:
+            return  # "Speaking..." is the more useful status while playing
+        self.status_label.config(text=message, fg=color)
     
     def download_piper_model(self):
         """Download Piper voice model"""
@@ -1673,14 +2102,14 @@ class UnifiedTTSApp:
 
         def download_thread():
             def update_status(msg):
-                self.root.after(0, lambda: self.status_label.config(text=msg, fg=self.ACCENT_BLUE))
+                self._post(lambda: self.status_label.config(text=msg, fg=self.ACCENT_BLUE))
             
             success = self.engines['piper'].download_model(update_status)
             
             if success:
-                self.root.after(0, self.refresh_engines_after_download)
+                self._post(self.refresh_engines_after_download)
             else:
-                self.root.after(0, lambda: self.download_button.config(state="normal", text="Download Voice Model"))
+                self._post(lambda: self.download_button.config(state="normal", text="Download Voice Model"))
         
         thread = threading.Thread(target=download_thread, daemon=True)
         thread.start()
@@ -1690,14 +2119,11 @@ class UnifiedTTSApp:
         self.download_button.pack_forget()
         self.engines['piper'].invalidate_availability()
         self.check_engines_and_initialize()
-        
+
         # Select Piper TTS if now available
-        engine_items = self.engine_combo['values']
-        for i, item in enumerate(engine_items):
-            if "Piper TTS (Offline)" in item:
-                self.engine_combo.current(i)
-                self.on_engine_change()
-                break
+        if self.engines['piper'].is_available():
+            self.engine_combo.current(self._engine_keys.index('piper'))
+            self.on_engine_change()
     
     def update_speed_label(self, value):
         """Update the speed label and the thread-safe speed mirror."""
@@ -1760,6 +2186,8 @@ class UnifiedTTSApp:
         kwargs = {}
         if isinstance(self.current_engine, GoogleTTSEngine):
             kwargs["language"] = self._current_language
+        elif isinstance(self.current_engine, NeuralTTSEngine):
+            kwargs["voice"] = self._current_voice or self.current_engine.spec.default_voice
         return self._current_speed, kwargs
 
     def _wire_playback_callbacks(self):
@@ -1769,17 +2197,16 @@ class UnifiedTTSApp:
         self.playback.engine_name_provider = (
             lambda: self.current_engine.get_name() if self.current_engine else ""
         )
-        self.playback.on_sentence_start = lambda index: self.root.after(
-            0, self._on_sentence_start
-        )
-        self.playback.on_generating = lambda index: self.root.after(0, self._on_generating)
-        self.playback.on_finished = lambda: self.root.after(0, self._on_playback_finished)
-        self.playback.on_error = lambda exc: self.root.after(
-            0, lambda: self._on_playback_error(exc)
-        )
+        self.playback.on_sentence_start = lambda index: self._post(self._on_sentence_start)
+        self.playback.on_generating = lambda index: self._post(self._on_generating)
+        self.playback.on_finished = lambda: self._post(self._on_playback_finished)
+        self.playback.on_error = lambda exc: self._post(lambda: self._on_playback_error(exc))
 
     def _start_playback(self):
         self._cancel_pending_restart()
+        if self.current_engine is not None:
+            # Resuming after a switch made while paused uses the new engine
+            self.playback.engine = self.current_engine
         self._wire_playback_callbacks()
         self.playback.state = PlaybackController.State.PLAYING
         self._update_play_button("⏸", self.ACCENT_ORANGE)
@@ -1855,7 +2282,10 @@ class UnifiedTTSApp:
             self.playback.start_playback_thread()
 
     def _on_generating(self):
-        self.status_label.config(text="Generating audio\u2026", fg=self.ACCENT_BLUE)
+        # The first sentence after picking a heavy voice waits on the model
+        # loading; say that, rather than imply the sentence itself is slow.
+        text = self._loading_message or "Generating audio\u2026"
+        self.status_label.config(text=text, fg=self.ACCENT_BLUE)
 
     def _on_sentence_start(self):
         self.status_label.config(text="Speaking\u2026", fg=self.ACCENT_BLUE)
@@ -1937,8 +2367,12 @@ class UnifiedTTSApp:
                 engine_name=self.current_engine.get_name() if self.current_engine else "",
             )
         self._cancel_pending_restart()
+        if self._ui_poll_id is not None:
+            self.root.after_cancel(self._ui_poll_id)
+            self._ui_poll_id = None
         self.session_store.save_last_text(self.text_area.get("1.0", "end-1c"))
         self.playback.cleanup()
+        self.voice_client.close()
         if PYGAME_AVAILABLE:
             pygame.quit()
         self.root.destroy()

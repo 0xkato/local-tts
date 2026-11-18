@@ -1,0 +1,13 @@
+# Neural voices: Phonon, Kokoro, Ming 3.0, Breeze TTS 2 and Fish Drama 3.
+#
+# These go in their own environment (Python 3.11+), not the app's -- the app
+# runs them in a worker process. See "Neural voices" in the README.
+
+# Phonon: light, runs anywhere
+ptts==0.7.1
+numpy>=1.26
+
+# Kokoro, Ming, Breeze and Drama 3 run on Apple Silicon through MLX
+mlx-audio==0.6.6 ; sys_platform == "darwin" and platform_machine == "arm64"
+misaki[en]==0.9.4 ; sys_platform == "darwin" and platform_machine == "arm64"
+en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl ; sys_platform == "darwin" and platform_machine == "arm64"

@@ -11,7 +11,6 @@ import time
 from enum import Enum
 import threading
 import os
-import sys
 import tempfile
 import subprocess
 import shutil

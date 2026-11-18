@@ -2,7 +2,6 @@
 
 import os
 import queue
-import re
 import sys
 import threading
 import tkinter as tk

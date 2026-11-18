@@ -92,6 +92,14 @@ class SentenceSplitter:
             return nxt < len(text) and text[nxt] in ' \t'
         return False
 
+    @staticmethod
+    def _blank_line_follows(text: str, newline: int) -> bool:
+        """True if the line after this newline holds nothing but spaces/tabs."""
+        j = newline + 1
+        while j < len(text) and text[j] in ' \t':
+            j += 1
+        return j < len(text) and text[j] == '\n'
+
     def get_positions(self, text: str) -> list[tuple[int, int]]:
         if not text or not text.strip():
             return []
@@ -116,6 +124,19 @@ class SentenceSplitter:
 
             # Inside a list item, a newline ends the sentence (each line = one item)
             if in_list_item and text[i] == '\n':
+                end = i
+                while end > sentence_start and text[end - 1].isspace():
+                    end -= 1
+                if end > sentence_start:
+                    positions.append((sentence_start, end))
+                sentence_start = None
+                in_list_item = False
+                i += 1
+                continue
+
+            # A blank line ends the sentence: headings and captions carry no
+            # full stop and would otherwise run into the next paragraph.
+            if text[i] == '\n' and self._blank_line_follows(text, i):
                 end = i
                 while end > sentence_start and text[end - 1].isspace():
                     end -= 1

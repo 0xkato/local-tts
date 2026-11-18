@@ -112,3 +112,26 @@ class TestSentenceSplitter:
         result = self.splitter.split(text)
         assert result == ["(Is this real?)", "Yes it is."]
 
+    # ── Paragraph breaks ──
+
+    def test_a_blank_line_ends_a_heading_without_a_full_stop(self):
+        """Headings rarely end in punctuation; without this they merge into
+        the paragraph after them and are read as one breathless sentence."""
+        text = "Why it matters\n\nThe study ran for ten years. It ended in May."
+        assert self.splitter.split(text) == [
+            "Why it matters", "The study ran for ten years.", "It ended in May."]
+
+    def test_a_blank_line_with_spaces_on_it_still_counts(self):
+        text = "A caption \n \t\nNext paragraph."
+        assert self.splitter.split(text) == ["A caption", "Next paragraph."]
+
+    def test_a_single_newline_does_not_end_a_sentence(self):
+        """Line-wrapped text: the sentence carries on onto the next line."""
+        text = "This sentence was wrapped\nonto two lines. Next."
+        assert self.splitter.split(text) == [
+            "This sentence was wrapped\nonto two lines.", "Next."]
+
+    def test_paragraph_positions_point_at_the_text(self):
+        text = "Title\n\nBody text here."
+        positions = self.splitter.get_positions(text)
+        assert [text[s:e] for s, e in positions] == ["Title", "Body text here."]

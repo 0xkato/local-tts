@@ -2,7 +2,7 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from tts_unified import SentenceSplitter
+from local_tts.engine import SentenceSplitter
 
 
 class TestSentenceSplitter:
@@ -111,3 +111,4 @@ class TestSentenceSplitter:
         text = "(Is this real?) Yes it is."
         result = self.splitter.split(text)
         assert result == ["(Is this real?)", "Yes it is."]
+

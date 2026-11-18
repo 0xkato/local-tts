@@ -14,16 +14,17 @@ cd local-tts
 brew install espeak-ng ffmpeg        # Kokoro needs espeak-ng; speed control needs ffmpeg
 
 # The app itself (any Python 3.10+ with Tk)
-uv venv && uv pip install -r requirements.txt
+uv venv && uv pip install -e .
 
 # The voices, in an environment of their own (Python 3.11+)
 uv venv -p 3.11 ~/.local/share/local-tts/voices-env
 VIRTUAL_ENV=~/.local/share/local-tts/voices-env uv pip install -r requirements-voices.txt
 
-uv run python tts_unified.py
+.venv/bin/local-tts
 ```
 
-`python tts_unified.py --check` lists anything that is still missing.
+`local-tts --check` lists anything that is still missing. `python tts_unified.py`
+starts the app too.
 
 ## Voices
 
@@ -63,6 +64,22 @@ app's own Python stays light. The app finds the environment on its own; set
 - An Apple Silicon Mac for Kokoro and Ming; Phonon runs anywhere
 - espeak-ng (Kokoro) and ffmpeg (speed control)
 - Audio output device
+
+## Using the engine from other code
+
+The engine is a package without any window code, so other front ends can
+install and import it:
+
+```bash
+pip install "local-tts @ git+https://github.com/0xkato/local-tts@v1.0.0"
+```
+
+```python
+from local_tts.engine import NeuralTTSEngine, PlaybackController, VoiceWorkerClient
+from local_tts.voices import voice_catalog
+```
+
+`local_tts/app.py` is the desktop window built on it.
 
 ## Tests
 

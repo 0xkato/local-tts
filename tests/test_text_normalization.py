@@ -9,7 +9,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from tts_unified import normalize_for_tts, SentenceSplitter
+from local_tts.engine import normalize_for_tts, SentenceSplitter
 
 
 class TestNumbersReachEngineIntact:

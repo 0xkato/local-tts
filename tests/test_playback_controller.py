@@ -5,7 +5,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from tts_unified import PlaybackController, SentenceSplitter, SessionStore
+from local_tts.engine import PlaybackController, SentenceSplitter, SessionStore
 from enum import Enum
 
 

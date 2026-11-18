@@ -14,3 +14,8 @@ venv/
 # Audio clips from testing voices
 *.wav
 *.mp3
+
+# Build output
+build/
+dist/
+*.egg-info/

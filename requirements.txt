@@ -1,2 +1,0 @@
-# The app itself. The voices have their own environment: see requirements-voices.txt
-pygame==2.5.2        # audio playback

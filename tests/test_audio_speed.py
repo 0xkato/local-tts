@@ -13,7 +13,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from tts_unified import atempo_chain, ffmpeg_available, time_stretch
+from local_tts.engine import atempo_chain, ffmpeg_available, time_stretch
 
 
 def make_wav(seconds=2.0, rate=22050):

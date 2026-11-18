@@ -7,9 +7,9 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import tts_unified
-import voice_catalog
-from tts_unified import NeuralTTSEngine, PlaybackController, SessionStore
+import local_tts.engine as tts_unified
+from local_tts.voices import voice_catalog
+from local_tts.engine import NeuralTTSEngine, PlaybackController, SessionStore
 
 
 class RecordingClient:

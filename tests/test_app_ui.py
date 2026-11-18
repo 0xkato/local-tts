@@ -25,8 +25,10 @@ except Exception:
 
 pytestmark = pytest.mark.skipif(not TK_OK, reason="no usable Tk display")
 
-import tts_unified
-from tts_unified import PlaybackController, UnifiedTTSApp, SessionStore
+import local_tts.engine as tts_unified
+import local_tts.app as tts_app
+from local_tts.engine import PlaybackController, SessionStore
+from local_tts.app import UnifiedTTSApp
 
 
 class SilentPlayer:
@@ -217,8 +219,8 @@ class TestResumeDoesNotSwallowPlay:
 class TestErrorsStayOutOfTheWay:
     def test_failure_reports_in_the_status_bar_not_a_modal(self):
         modals = []
-        real = tts_unified.messagebox.showerror
-        tts_unified.messagebox.showerror = lambda *a, **kw: modals.append(a)
+        real = tts_app.messagebox.showerror
+        tts_app.messagebox.showerror = lambda *a, **kw: modals.append(a)
         try:
             h = AppHarness(TEXT, engine=StubEngine(fail=True), store_dir=tempfile.mkdtemp())
             out = h.run([
@@ -228,7 +230,7 @@ class TestErrorsStayOutOfTheWay:
             ])
             h.close()
         finally:
-            tts_unified.messagebox.showerror = real
+            tts_app.messagebox.showerror = real
         status, state = out[1]
         assert not modals, "a dropped connection popped a modal dialog"
         assert "connection reset" in status.lower() or "error" in status.lower(), status
@@ -440,8 +442,8 @@ class TestRemembersArticleAndShowsTimeLeft:
 
 # ── Neural voices in the engine dropdown ────────────────────────────────────
 
-import voice_catalog
-from tts_unified import NeuralTTSEngine
+from local_tts.voices import voice_catalog
+from local_tts.engine import NeuralTTSEngine
 
 
 class FakeVoiceClient:

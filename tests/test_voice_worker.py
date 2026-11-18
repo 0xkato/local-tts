@@ -16,8 +16,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 pytest.importorskip("numpy")  # the worker itself needs numpy
 
-import voice_catalog
-from tts_unified import VoiceSwitched, VoiceWorkerClient
+from local_tts.voices import voice_catalog
+from local_tts.engine import VoiceSwitched, VoiceWorkerClient
 
 
 def make_client(tmp_path, **env):
@@ -178,7 +178,7 @@ class TestSwitchingVoices:
 # already walked away from keep loading (up to 24 GB), or killed a download.
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-REAL_WORKER = os.path.join(REPO, "voice_worker.py")
+REAL_WORKER = os.path.join(REPO, "local_tts", "voices", "voice_worker.py")
 
 SLOW_START = """
 import os, runpy, sys, time
@@ -229,7 +229,7 @@ class TestStartupRaces:
         assert outcome["took"] < 5
 
     def test_closing_while_the_worker_starts_leaves_nothing_running(self, tmp_path, monkeypatch):
-        import tts_unified
+        import local_tts.engine as tts_unified
         real_popen = tts_unified.subprocess.Popen
         spawned = []
 

@@ -51,7 +51,7 @@ def test_the_wheel_carries_the_voice_worker(tmp_path):
     wheel = next(p for p in os.listdir(out) if p.endswith(".whl"))
     names = zipfile.ZipFile(out / wheel).namelist()
     voices = sorted(n for n in names if n.startswith("local_tts/voices/"))
-    assert voices == ["local_tts/voices/__init__.py", "local_tts/voices/voice_catalog.py",
-                      "local_tts/voices/voice_worker.py"]
+    assert voices == ["local_tts/voices/__init__.py", "local_tts/voices/espeak_link.py",
+                      "local_tts/voices/voice_catalog.py", "local_tts/voices/voice_worker.py"]
     assert "local_tts/engine.py" in names and "local_tts/app.py" in names
     assert not [n for n in names if n.startswith("tests/")]

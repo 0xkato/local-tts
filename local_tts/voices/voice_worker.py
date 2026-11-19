@@ -96,6 +96,8 @@ def _use_system_espeak():
     if paths is None:
         raise RuntimeError("Kokoro needs espeak-ng: brew install espeak-ng")
     import misaki.espeak  # noqa: F401 -- sets the broken paths on import
+    import espeak_link
+    espeak_link.install()   # started by a browser, a copied library is refused
     from phonemizer.backend.espeak.wrapper import EspeakWrapper
     EspeakWrapper.set_library(paths[0])
     EspeakWrapper.set_data_path(paths[1])

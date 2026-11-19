@@ -26,6 +26,12 @@ VIRTUAL_ENV=~/.local/share/local-tts/voices-env uv pip install ".[voices]"
 `local-tts --check` lists anything that is still missing. `python tts_unified.py`
 starts the app too.
 
+## In your browser
+
+[Local TTS for your browser](https://github.com/0xkato/local-tts-plugin)
+reads text you highlight on any web page with the same voices, in Firefox,
+Chrome and Brave.
+
 ## Voices
 
 Pick one from the engine dropdown, with a voice picker beside it:
@@ -79,7 +85,9 @@ from local_tts.engine import NeuralTTSEngine, PlaybackController, VoiceWorkerCli
 from local_tts.voices import voice_catalog
 ```
 
-`local_tts/app.py` is the desktop window built on it.
+`local_tts/app.py` is the desktop window built on it, and
+[local-tts-plugin](https://github.com/0xkato/local-tts-plugin) the browser
+extension.
 
 ## Tests
 

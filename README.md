@@ -18,7 +18,7 @@ uv venv && uv pip install -e .
 
 # The voices, in an environment of their own (Python 3.11+)
 uv venv -p 3.11 ~/.local/share/local-tts/voices-env
-VIRTUAL_ENV=~/.local/share/local-tts/voices-env uv pip install -r requirements-voices.txt
+VIRTUAL_ENV=~/.local/share/local-tts/voices-env uv pip install ".[voices]"
 
 .venv/bin/local-tts
 ```
@@ -71,7 +71,7 @@ The engine is a package without any window code, so other front ends can
 install and import it:
 
 ```bash
-pip install "local-tts @ git+https://github.com/0xkato/local-tts@v1.0.1"
+pip install "local-tts @ git+https://github.com/0xkato/local-tts@v1.1.0"
 ```
 
 ```python

@@ -209,3 +209,69 @@ class TestGeneratingIsAnnounced:
         c.generate_sentence(0, 1.0)
         assert c.is_buffered(0, 1.0) is True
         assert c.is_buffered(0, 2.0) is False, "speed is part of the buffer identity"
+
+
+# ── Retired threads must not touch the reading that replaced them ─────────
+# Regression cover from the plugin review: a thread retired by cancel() could
+# still stop the new reading, or report a sentence after the pause.
+
+class FailsWhenReleased(FakeEngine):
+    """Holds the first generate until released, then fails it."""
+
+    def __init__(self):
+        super().__init__()
+        self.release = threading.Event()
+        self.waiting = threading.Event()
+
+    def generate(self, text, speed, **kwargs):
+        self.waiting.set()
+        self.release.wait(5)
+        raise RuntimeError("the old voice went away")
+
+
+class TestRetiredThreads:
+    def test_a_retired_thread_that_fails_does_not_stop_the_new_reading(self):
+        c, _, player, _ = make_controller(sentences=6, play_duration=0.3)
+        failing = FailsWhenReleased()
+        c.engine = failing
+        c.GENERATE_ATTEMPTS = 1
+        c.state = PlaybackController.State.PLAYING
+        c.start_playback_thread()
+        assert failing.waiting.wait(5)
+        # what a voice switch does: retire the thread, carry on with a new engine
+        c.cancel()
+        c.cleanup_buffer()
+        c.engine = FakeEngine()
+        c.start_playback_thread()
+        failing.release.set()            # the retired thread now fails
+        time.sleep(0.8)
+        try:
+            assert c.state == PlaybackController.State.PLAYING
+            assert len(player.play_log) >= 2, "the new reading stopped after its first clip"
+        finally:
+            c.state = PlaybackController.State.STOPPED
+            c.cancel()
+
+    def test_no_sentence_is_announced_once_cancel_has_returned(self):
+        c, _, _, _ = make_controller(sentences=6, play_duration=1.0)
+        log = []
+        inside, release = threading.Event(), threading.Event()
+
+        def on_sentence_start(index):
+            log.append(f"sentence {index}")
+            if index == 0:
+                inside.set()
+                release.wait(5)      # a slow UI, mid-announcement
+
+        c.on_sentence_start = on_sentence_start
+        c.state = PlaybackController.State.PLAYING
+        c.start_playback_thread()
+        assert inside.wait(5)
+        canceller = threading.Thread(target=lambda: (c.cancel(), log.append("cancelled")))
+        canceller.start()
+        time.sleep(0.3)
+        assert "cancelled" not in log, "cancel() returned while a sentence was being announced"
+        release.set()
+        canceller.join(5)
+        time.sleep(0.3)
+        assert log == ["sentence 0", "cancelled"]

@@ -135,3 +135,7 @@ class TestSentenceSplitter:
         text = "Title\n\nBody text here."
         positions = self.splitter.get_positions(text)
         assert [text[s:e] for s, e in positions] == ["Title", "Body text here."]
+
+    def test_windows_line_endings_count_as_a_blank_line(self):
+        text = "Why it matters\r\n\r\nThe study ran for ten years."
+        assert self.splitter.split(text) == ["Why it matters", "The study ran for ten years."]

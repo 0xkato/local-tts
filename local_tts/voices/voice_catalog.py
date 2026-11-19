@@ -149,6 +149,12 @@ def espeak_paths() -> tuple[str, str] | None:
     return None
 
 
+def kokoro_lang_code(voice: str) -> str:
+    """Kokoro's pronunciation rules for a voice: its id starts with the accent,
+    "a" for American and "b" for British (bf_emma, bm_george)."""
+    return "b" if voice[:1] == "b" else "a"
+
+
 def unavailable_reason(spec: EngineSpec) -> str:
     """Why an engine cannot run here, or "" when it can."""
     if spec.apple_only and not is_apple_silicon():

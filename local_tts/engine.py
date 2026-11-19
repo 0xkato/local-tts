@@ -95,7 +95,7 @@ class SentenceSplitter:
     def _blank_line_follows(text: str, newline: int) -> bool:
         """True if the line after this newline holds nothing but spaces/tabs."""
         j = newline + 1
-        while j < len(text) and text[j] in ' \t':
+        while j < len(text) and text[j] in ' \t\r':
             j += 1
         return j < len(text) and text[j] == '\n'
 
@@ -558,6 +558,7 @@ class VoiceWorkerClient:
     START_TIMEOUT = 60
     LOAD_TIMEOUT = 120
     SYNTH_TIMEOUT = 120
+    LOG_MAX_BYTES = 1_000_000   # set aside as .old beyond this, when a worker starts
 
     def __init__(self, python=None, script=None, log_path=None, extra_env=None):
         self.python = python or voice_catalog.voices_python()
@@ -658,6 +659,7 @@ class VoiceWorkerClient:
                 self._loading = engine_key   # this request may (re)load a model
 
     def _spawn(self):
+        self._rotate_log()
         if not os.path.exists(self.python):
             raise RuntimeError(
                 f"voices environment not found at {self.python} -- see the README")
@@ -674,6 +676,13 @@ class VoiceWorkerClient:
         with self._state_lock:
             self._loaded = None
         self._await(replies, 0, self.START_TIMEOUT)
+
+    def _rotate_log(self):
+        try:
+            if os.path.getsize(self.log_path) > self.LOG_MAX_BYTES:
+                os.replace(self.log_path, self.log_path + ".old")
+        except OSError:
+            pass   # no log yet
 
     @staticmethod
     def _read(proc, replies):
@@ -1109,7 +1118,8 @@ class PlaybackController:
                 # Only announce when there is an actual wait: the lookahead
                 # usually has the clip ready and the label would just flicker.
                 if self.on_generating and not self.is_buffered(index, speed, **kwargs):
-                    self.on_generating(index)
+                    if not self._while_current(gen, lambda: self.on_generating(index)):
+                        return
 
                 audio_path, failure = None, None
                 for attempt in range(1, self.GENERATE_ATTEMPTS + 1):
@@ -1126,27 +1136,29 @@ class PlaybackController:
                         if attempt < self.GENERATE_ATTEMPTS:
                             time.sleep(self.RETRY_BACKOFF * attempt)
                 if failure is not None:
-                    self.state = self.State.STOPPED
-                    if self.is_current(gen) and self.on_error:
-                        self.on_error(failure)
+                    self._while_current(gen, lambda: self._stop_with(self.on_error, failure))
                     return
 
                 if not self.is_current(gen):
                     return
 
                 self._start_lookahead(index, speed, kwargs, gen)
-                if self.on_sentence_start:
-                    self.on_sentence_start(index)
+                playable = (audio_path and os.path.exists(audio_path)
+                            and self._player is not None)
 
-                if audio_path and os.path.exists(audio_path) and self._player is not None:
-                    # Claiming the token and starting the clip under one lock
-                    # keeps a thread retired mid-step from ever reaching the
-                    # speaker after cancel() has silenced it.
-                    with self._gen_lock:
-                        if not self.is_current(gen):
-                            return
+                def start_sentence():
+                    if self.on_sentence_start:
+                        self.on_sentence_start(index)
+                    if playable:
                         self._player.play(audio_path)
                         self._active_path = audio_path
+
+                # Announcing and starting the clip under the token's lock keeps
+                # a thread retired mid-step from reaching the speaker, or the
+                # listener, after cancel() has returned.
+                if not self._while_current(gen, start_sentence):
+                    return
+                if playable:
                     while self.is_current(gen) and self._player.is_busy():
                         time.sleep(self.POLL_INTERVAL)
 
@@ -1162,13 +1174,25 @@ class PlaybackController:
                 # index to the sentence after the one it actually played.
                 self.current_index = index + 1
 
-            if self.is_current(gen):
-                self.state = self.State.STOPPED
-                if self.on_finished:
-                    self.on_finished()
+            self._while_current(gen, lambda: self._stop_with(self.on_finished))
         except Exception as exc:
-            if self.is_current(gen) and self.on_error:
-                self.on_error(exc)
+            self._while_current(gen, lambda: self._stop_with(self.on_error, exc))
+
+    def _while_current(self, gen: int, action) -> bool:
+        """Run `action` only if this thread still holds the token, and under the
+        lock cancel() takes: a retired thread can neither stop the reading that
+        replaced it nor report to the listener once cancel() has returned.
+        The hooks must not block on anything that needs this lock."""
+        with self._gen_lock:
+            if not self.is_current(gen):
+                return False
+            action()
+            return True
+
+    def _stop_with(self, hook, *args) -> None:
+        self.state = self.State.STOPPED
+        if hook:
+            hook(*args)
 
     # ── Session persistence ─────────────────────────────────────────────
 

@@ -289,3 +289,29 @@ class TestSlowSentences:
         c.cancel()
         played = [int(p.split("-s")[1].split("-")[0]) for p in player.log]
         assert played[:3] == [0, 1, 2], f"sentence 1 was skipped: {played}"
+
+
+class TestKokoroAccent:
+    def test_uk_voices_get_british_pronunciation(self):
+        assert voice_catalog.kokoro_lang_code("bf_emma") == "b"
+        assert voice_catalog.kokoro_lang_code("bm_george") == "b"
+
+    def test_us_and_unknown_voices_get_american(self):
+        assert voice_catalog.kokoro_lang_code("af_heart") == "a"
+        assert voice_catalog.kokoro_lang_code("") == "a"
+        assert voice_catalog.kokoro_lang_code("zz_new") == "a"
+
+
+class TestWorkerLog:
+    def test_a_big_log_is_set_aside_when_a_worker_starts(self, tmp_path):
+        import local_tts.engine as engine
+        log = tmp_path / "voices-worker.log"
+        log.write_text("x" * 2000)
+        client = engine.VoiceWorkerClient(python=str(tmp_path / "no-python"), log_path=str(log))
+        client.LOG_MAX_BYTES = 1000
+        try:
+            client._spawn()
+        except RuntimeError:
+            pass   # no interpreter there; the log is handled first
+        assert (tmp_path / "voices-worker.log.old").read_text() == "x" * 2000
+        assert not log.exists() or log.stat().st_size < 1000

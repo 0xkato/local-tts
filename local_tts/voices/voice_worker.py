@@ -114,7 +114,8 @@ class MlxEngine:
     def synth(self, text, voice, speed):
         key = self.spec.key
         if key == "kokoro":
-            return collect(self.model.generate(text=text, voice=voice, speed=speed, lang_code="a"))
+            return collect(self.model.generate(text=text, voice=voice, speed=speed,
+                                               lang_code=catalog.kokoro_lang_code(voice)))
         if key == "ming":
             return collect(self.model.generate(text=text, voice=voice, lang_code="en"))
         raise RuntimeError(f"no recipe for engine {key!r}")

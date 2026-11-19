@@ -71,7 +71,7 @@ The engine is a package without any window code, so other front ends can
 install and import it:
 
 ```bash
-pip install "local-tts @ git+https://github.com/0xkato/local-tts@v1.1.0"
+pip install "local-tts @ git+https://github.com/0xkato/local-tts@v1.1.1"
 ```
 
 ```python

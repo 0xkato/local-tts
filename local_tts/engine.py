@@ -1176,7 +1176,8 @@ class PlaybackController:
 
             self._while_current(gen, lambda: self._stop_with(self.on_finished))
         except Exception as exc:
-            self._while_current(gen, lambda: self._stop_with(self.on_error, exc))
+            crash = exc
+            self._while_current(gen, lambda: self._stop_with(self.on_error, crash))
 
     def _while_current(self, gen: int, action) -> bool:
         """Run `action` only if this thread still holds the token, and under the
